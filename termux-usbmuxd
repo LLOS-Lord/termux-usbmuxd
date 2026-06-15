@@ -1,0 +1,110 @@
+#!/data/data/com.termux/files/usr/bin/bash
+#
+# termux-usbmuxd - Run usbmuxd rootless via termux-usb
+#
+# Author: usedoperative-sudo/Used (Me)
+# License: MIT
+# Repo: https://github.com/usedoperative-sudo/termux-usbmuxd
+#
+set -euo pipefail
+
+usage() {
+  local rc=${1:-0}
+  cat <<'EOF'
+Usage: termux-usbmuxd [options] <device>
+
+Wrapper to run usbmuxd rootless via termux-usb.
+
+Arguments:
+  <device>            USB device path (e.g. /dev/bus/usb/001/002)
+
+Options:
+  -s, --socket ADDR  Socket address (default: $PREFIX/var/run/usbmuxd)
+                     TCP example: 127.0.0.1:27015
+  -p, --pidfile PATH PID file path (use "NONE" to disable)
+  -f, --foreground   Run in foreground (default: background)
+  -v, --verbose      Verbose output
+  -h, --help         Show this help
+
+Examples:
+  termux-usbmuxd /dev/bus/usb/001/002
+  termux-usbmuxd -s 127.0.0.1:27015 -p NONE /dev/bus/usb/001/002
+
+Note: for Unix sockets, clients must use "UNIX:" prefix:
+  export USBMUXD_SOCKET_ADDRESS=UNIX:/path/to/socket
+EOF
+  exit "$rc"
+}
+
+SOCKET="$PREFIX/var/run/usbmuxd"
+PIDFILE="$PREFIX/var/run/usbmuxd.pid"
+PAIRING_DIR="$PREFIX/var/lib/lockdown"
+FOREGROUND=false
+VERBOSE=false
+DEVICE=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -s|--socket)     SOCKET="$2"; shift 2 ;;
+    -p|--pidfile)    PIDFILE="$2"; shift 2 ;;
+    -f|--foreground) FOREGROUND=true; shift ;;
+    -v|--verbose)    VERBOSE=true; shift ;;
+    -h|--help)       usage ;;
+    --)              shift; break ;;
+    -*)              echo "unknown option: $1" >&2; usage 1 ;;
+    *)               DEVICE="$1"; shift ;;
+  esac
+done
+
+if [[ -z "$DEVICE" ]]; then
+  echo "error: device path required"
+  echo "list devices: termux-usb -l"
+  exit 1
+fi
+
+if [[ ! -e "$PAIRING_DIR" ]]; then
+  mkdir -p "$PAIRING_DIR"
+  echo "created pairing dir: $PAIRING_DIR"
+fi
+
+USBMUXD_ARGS=()
+ENV_VAR=""
+
+if [[ "$SOCKET" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+: ]]; then
+  USBMUXD_ARGS+=(--socket "$SOCKET")
+  ENV_VAR="$SOCKET"
+else
+  mkdir -p "$(dirname "$SOCKET")"
+  USBMUXD_ARGS+=(--socket "$SOCKET")
+  ENV_VAR="UNIX:$SOCKET"
+fi
+
+USBMUXD_ARGS+=(--pidfile "$PIDFILE")
+
+if $FOREGROUND; then
+  USBMUXD_ARGS+=(-f)
+fi
+
+if $VERBOSE; then
+  USBMUXD_ARGS+=(-v)
+fi
+
+echo "==> starting usbmuxd for $DEVICE"
+echo "    socket: $SOCKET"
+echo "    pidfile: $PIDFILE"
+echo "    pairing: $PAIRING_DIR"
+
+if $FOREGROUND; then
+  termux-usb -r -E -e "usbmuxd ${USBMUXD_ARGS[*]}" "$DEVICE"
+else
+  termux-usb -r -E -e "usbmuxd ${USBMUXD_ARGS[*]}" "$DEVICE" &
+  USBPID=$!
+  sleep 2
+  if kill -0 "$USBPID" 2>/dev/null; then
+    echo "==> usbmuxd running (pid $USBPID)"
+    echo "    socket: $SOCKET"
+    echo "    export USBMUXD_SOCKET_ADDRESS=$ENV_VAR"
+  else
+    echo "==> usbmuxd exited"
+  fi
+fi

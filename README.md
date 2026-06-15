@@ -84,7 +84,7 @@ ideviceinfo
 ideviceinstaller -i your-app.ipa
 ```
 
-Or use SideStore to sideload wirelessly from your Android device.
+Or install SideStore to sideload wirelessly from your Android device. (More info [here](https://github.com/usedoperative-sudo/termux-usbmuxd/blob/main/Step-To-Step.md))
 
 ## Options
 

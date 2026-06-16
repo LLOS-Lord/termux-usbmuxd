@@ -70,7 +70,7 @@ export USBMUXD_SOCKET_ADDRESS=UNIX:$PREFIX/var/run/usbmuxd
 idevicepair pair
 ```
 
-Unlock your iPhone and tap "Trust This Computer" when prompted.
+Unlock your iPhone and tap "Trust This Computer" when prompted then execute the command again.
 
 ### 6. Verify connection
 
@@ -78,13 +78,7 @@ Unlock your iPhone and tap "Trust This Computer" when prompted.
 ideviceinfo
 ```
 
-### 7. Install apps
-
-```bash
-ideviceinstaller -i your-app.ipa
-```
-
-Or install SideStore to sideload wirelessly from your Android device. (More info [here](https://github.com/usedoperative-sudo/termux-usbmuxd/blob/main/Step-To-Step.md))
+With this tool you can install SideStore to sideload wirelessly from your Android device. (More info [here](https://github.com/usedoperative-sudo/termux-usbmuxd/blob/main/Step-To-Step.md))
 
 ## Options
 

@@ -1,110 +1,162 @@
 #!/data/data/com.termux/files/usr/bin/bash
 #
-# termux-usbmuxd - Run usbmuxd rootless via termux-usb
-#
-# Author: usedoperative-sudo/Used (Me)
-# License: MIT
-# Repo: https://github.com/usedoperative-sudo/termux-usbmuxd
+# termux-usbmuxd - Rootless usbmuxd management (Absolutely Stable Version)
 #
 set -euo pipefail
 
-usage() {
-  local rc=${1:-0}
-  cat <<'EOF'
-Usage: termux-usbmuxd [options] <device>
-
-Wrapper to run usbmuxd rootless via termux-usb.
-
-Arguments:
-  <device>            USB device path (e.g. /dev/bus/usb/001/002)
-
-Options:
-  -s, --socket ADDR  Socket address (default: $PREFIX/var/run/usbmuxd)
-                     TCP example: 127.0.0.1:27015
-  -p, --pidfile PATH PID file path (use "NONE" to disable)
-  -f, --foreground   Run in foreground (default: background)
-  -v, --verbose      Verbose output
-  -h, --help         Show this help
-
-Examples:
-  termux-usbmuxd /dev/bus/usb/001/002
-  termux-usbmuxd -s 127.0.0.1:27015 -p NONE /dev/bus/usb/001/002
-
-Note: for Unix sockets, clients must use "UNIX:" prefix:
-  export USBMUXD_SOCKET_ADDRESS=UNIX:/path/to/socket
-EOF
-  exit "$rc"
-}
-
 SOCKET="$PREFIX/var/run/usbmuxd"
 PIDFILE="$PREFIX/var/run/usbmuxd.pid"
-PAIRING_DIR="$PREFIX/var/lib/lockdown"
-FOREGROUND=false
-VERBOSE=false
-DEVICE=""
+LOGFILE="$HOME/.termux-usbmuxd.log"
+PROXY_BIN="$PREFIX/bin/usbmuxd_proxy"
 
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    -s|--socket)     SOCKET="$2"; shift 2 ;;
-    -p|--pidfile)    PIDFILE="$2"; shift 2 ;;
-    -f|--foreground) FOREGROUND=true; shift ;;
-    -v|--verbose)    VERBOSE=true; shift ;;
-    -h|--help)       usage ;;
-    --)              shift; break ;;
-    -*)              echo "unknown option: $1" >&2; usage 1 ;;
-    *)               DEVICE="$1"; shift ;;
-  esac
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
+log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+
+# Export default environment variables
+export USBMUXD_SOCKET_ADDRESS="UNIX:$SOCKET"
+
+get_devices() {
+  termux-usb -l 2>/dev/null | jq -r '.[]' 2>/dev/null || echo ""
+}
+
+start_usbmuxd() {
+  local device=${1:-""}
+  
+  if [[ -z "$device" ]]; then
+
+log_info "Scanning USB devices..."
+
+device=$(get_devices | head -n 1)
+
+if [[ -z "$device" ]]; then
+
+log_error "iPhone not found. Please plug in OTG cable."
+
+exit 1
+
+fi
+
+fi
+
+log_info "Requesting permission for $device..."
+
+termux-usb -r "$device" || { log_error "Permission denied."; exit 1; }
+
+# FIX: Use -x instead of -f to avoid accidentally killing this script
+
+log_info "Cleaning up old processes..."
+
+pkill -x "usbmuxd" || true
+
+pkill -x "usbmuxd_proxy" || true
+
+rm -f "$SOCKET" "$PIDFILE"
+
+log_info "Starting the usbmuxd daemon..."
+
+mkdir -p "$(dirname "$SOCKET")"
+
+# Start the background daemon and redirect the log
+
+nohup termux-usb -E -e "$PROXY_BIN --socket $SOCKET --pidfile $PIDFILE" "$device" >> "$LOGFILE" 2>&1 &
+
+# Wait for the socket to appear (maximum 10 seconds)
+
+local timeout=10
+
+while [[ $timeout -gt 0 ]]; do
+
+if [[ -S "$SOCKET" ]]; then break; fi
+
+sleep 1
+
+((timeout--))
 done
 
-if [[ -z "$DEVICE" ]]; then
-  echo "error: device path required"
-  echo "list devices: termux-usb -l"
-  exit 1
-fi
+if [[ -S "$SOCKET" ]]; then
 
-if [[ ! -e "$PAIRING_DIR" ]]; then
-  mkdir -p "$PAIRING_DIR"
-  echo "created pairing dir: $PAIRING_DIR"
-fi
+log_info "usbmuxd is ready at $SOCKET"
 
-USBMUXD_ARGS=()
-ENV_VAR=""
-
-if [[ "$SOCKET" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+: ]]; then
-  USBMUXD_ARGS+=(--socket "$SOCKET")
-  ENV_VAR="$SOCKET"
 else
-  mkdir -p "$(dirname "$SOCKET")"
-  USBMUXD_ARGS+=(--socket "$SOCKET")
-  ENV_VAR="UNIX:$SOCKET"
+
+log_error "Startup failed. Please check the log: cat $LOGFILE"
+
 fi
+}
 
-USBMUXD_ARGS+=(--pidfile "$PIDFILE")
+stop_usbmuxd() {
 
-if $FOREGROUND; then
-  USBMUXD_ARGS+=(-f)
-fi
+log_info "Stopping usbmuxd..."
 
-if $VERBOSE; then
-  USBMUXD_ARGS+=(-v)
-fi
+pkill -x "usbmuxd" || true
 
-echo "==> starting usbmuxd for $DEVICE"
-echo "    socket: $SOCKET"
-echo "    pidfile: $PIDFILE"
-echo "    pairing: $PAIRING_DIR"
+pkill -x "usbmuxd_proxy" || true
 
-if $FOREGROUND; then
-  termux-usb -r -E -e "usbmuxd ${USBMUXD_ARGS[*]}" "$DEVICE"
+rm -f "$SOCKET" "$PIDFILE"
+
+log_info "Stopped."
+
+}
+
+show_status() {
+if pgrep -x "usbmuxd" > /dev/null; then
+
+echo -e "Status: ${GREEN}RUNNING${NC}"
+
+idevice_id -l || echo "Device not detected via socket."
+
 else
-  termux-usb -r -E -e "usbmuxd ${USBMUXD_ARGS[*]}" "$DEVICE" &
-  USBPID=$!
-  sleep 2
-  if kill -0 "$USBPID" 2>/dev/null; then
-    echo "==> usbmuxd running (pid $USBPID)"
-    echo "    socket: $SOCKET"
-    echo "    export USBMUXD_SOCKET_ADDRESS=$ENV_VAR"
-  else
-    echo "==> usbmuxd exited"
-  fi
+
+echo -e "Status: ${RED}STOP${NC}"
+
 fi
+}
+
+interactive_menu() {
+while true; do
+
+echo -e "\n${BLUE}=== Termux-Usbmuxd Pro (Stable) ===${NC}"
+
+echo "1) Start usbmuxd"
+
+echo "2) Stop usbmuxd"
+
+echo "3) Pair"
+
+echo "4) View info"
+
+echo "q) Exit"
+
+echo -n "Select: "
+read -r opt
+
+case $opt in
+
+1) start_usbmuxd ;;
+
+2) stop_usbmuxd ;;
+
+3) idevicepair pair ;;
+
+4) ideviceinfo ;;
+
+q) exit 0 ;;
+esac
+  done
+}
+
+if [[ $# -eq 0 ]]; then interactive_menu; exit 0; fi
+case "$1" in
+  start) start_usbmuxd ;;
+  stop) stop_usbmuxd ;;
+  pair) ideapair pair ;;
+  info) ideaviceinfo ;;
+  *) interactive_menu ;;
+esac

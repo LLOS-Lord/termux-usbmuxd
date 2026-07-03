@@ -5,6 +5,10 @@
 set -euo pipefail
 
 SOCKET="$PREFIX/var/run/usbmuxd"
+TCP_PORT="${USBMUXD_TCP_PORT:-27015}" # Default TCP port, can be overridden by environment variable
+
+# Ensure USBMUXD_TCP_PORT is set for the script, even if empty
+: ${USBMUXD_TCP_PORT:=}
 PIDFILE="$PREFIX/var/run/usbmuxd.pid"
 LOGFILE="$HOME/.termux-usbmuxd.log"
 PROXY_BIN="$PREFIX/bin/usbmuxd_proxy"
@@ -20,7 +24,15 @@ log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
 # Export default environment variables
-export USBMUXD_SOCKET_ADDRESS="UNIX:$SOCKET"
+# NOTE: Rust-based tools (e.g. idevice-tools / jkcoxson's "idevice" crate) parse this
+# themselves and do NOT understand the libimobiledevice "UNIX:" prefix - any value
+# containing a colon is parsed as a TCP host:port SocketAddr, so "UNIX:/path" crashes
+# with "Bad USBMUXD_SOCKET_ADDRESS: AddrParseError(Socket)". The TCP port we already
+# expose via socat works for both classic libimobiledevice tools and idevice-tools,
+# so point everything at it instead.
+export USBMUXD_SOCKET_ADDRESS="127.0.0.1:$TCP_PORT"
+# We pass both to proxy, proxy will handle usbmuxd and socat for dual support
+PROXY_ARGS="--socket $SOCKET --tcp-port $TCP_PORT"
 
 get_devices() {
   termux-usb -l 2>/dev/null | jq -r '.[]' 2>/dev/null || echo ""
@@ -65,7 +77,7 @@ mkdir -p "$(dirname "$SOCKET")"
 
 # Start the background daemon and redirect the log
 
-nohup termux-usb -E -e "$PROXY_BIN --socket $SOCKET --pidfile $PIDFILE" "$device" >> "$LOGFILE" 2>&1 &
+nohup termux-usb -E -e "$PROXY_BIN $PROXY_ARGS --pidfile $PIDFILE" "$device" >> "$LOGFILE" 2>&1 &
 
 # Wait for the socket to appear (maximum 10 seconds)
 
@@ -73,21 +85,37 @@ local timeout=10
 
 while [[ $timeout -gt 0 ]]; do
 
-if [[ -S "$SOCKET" ]]; then break; fi
+if [[ -S "$SOCKET" || $(netstat -tuln | grep ":$TCP_PORT ") ]]; then break; fi
 
 sleep 1
 
 ((timeout--))
 done
 
+# Wait for the sockets to appear (maximum 10 seconds)
+local timeout=10
+while [[ $timeout -gt 0 ]]; do
+    if [[ -S "$SOCKET" ]] && netstat -tuln | grep -q ":$TCP_PORT "; then break; fi
+    sleep 1
+    ((timeout--))
+done
+
 if [[ -S "$SOCKET" ]]; then
-
-log_info "usbmuxd is ready at $SOCKET"
-
+    log_info "usbmuxd Unix socket is ready at $SOCKET"
 else
+    log_warn "usbmuxd Unix socket NOT ready."
+fi
 
-log_error "Startup failed. Please check the log: cat $LOGFILE"
+if netstat -tuln | grep -q ":$TCP_PORT "; then
+    log_info "usbmuxd TCP socket is ready at $TCP_PORT"
+else
+    log_warn "usbmuxd TCP socket NOT ready (check if 'socat' is installed)."
+fi
 
+if [[ ! -S "$SOCKET" && ! $(netstat -tuln | grep -q ":$TCP_PORT ") ]]; then
+    log_error "Startup failed. Neither Unix nor TCP socket is ready."
+    log_error "Check log: cat $LOGFILE"
+    exit 1
 fi
 }
 

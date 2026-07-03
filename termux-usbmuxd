@@ -4,7 +4,7 @@
 #
 set -euo pipefail
 
-SOCKET="$PREFIX/data/user/0/com.termux/files/usr/var/run/usbmuxd"
+SOCKET="$PREFIX/var/run/usbmuxd"
 TCP_PORT="${USBMUXD_TCP_PORT:-27015}" # Default TCP port, can be overridden by environment variable
 
 # Ensure USBMUXD_TCP_PORT is set for the script, even if empty
@@ -34,13 +34,101 @@ export USBMUXD_SOCKET_ADDRESS="127.0.0.1:$TCP_PORT"
 # We pass both to proxy, proxy will handle usbmuxd and socat for dual support
 PROXY_ARGS="--socket $SOCKET --tcp-port $TCP_PORT"
 
+fix_shell_rc() {
+  # === TẠI SAO CẦN HÀM NÀY ===
+  # export ở đầu file này chỉ có hiệu lực cho chính tiến trình script này và
+  # các tiến trình con của nó (idevicepair, ideviceinfo gọi từ menu). Nó
+  # KHÔNG thể "vọng ngược" ra phiên shell tương tác bên ngoài đã mở từ trước
+  # - đó là bản chất của biến môi trường trong Unix, không phải lỗi của script.
+  # Vì vậy nếu người dùng chạy trực tiếp một binary Rust độc lập như
+  # `./idevice-tools pair` ở một phiên shell khác, giá trị USBMUXD_SOCKET_ADDRESS
+  # mà binary đó nhìn thấy đến từ ~/.bashrc (hoặc ~/.zshrc), không phải từ đây.
+  #
+  # Nếu trước đó máy đã cài một bản termux-usbmuxd/hướng dẫn khác (rất phổ biến
+  # là mẫu "UNIX:$PREFIX/var/run/usbmuxd" theo đúng chuẩn libimobiledevice),
+  # dòng export cũ đó vẫn còn nằm trong .bashrc. Giá trị "UNIX:..." là ĐÚNG cho
+  # ideviceinfo/idevicepair (libimobiledevice, C) nhưng lại làm crash mọi tool
+  # viết bằng Rust (idevice-tools của jkcoxson) với đúng lỗi:
+  #   thread 'main' panicked: Bad USBMUXD_SOCKET_ADDRESS: AddrParseError(Socket)
+  # vì crate "idevice" không hiểu tiền tố "UNIX:" - nó chỉ hiểu: không có dấu
+  # ":" => coi là đường dẫn Unix socket thẳng; có dấu ":" => bắt buộc phải là
+  # một SocketAddr "host:port" hợp lệ tuyệt đối, không có tiền tố nào khác.
+  # "127.0.0.1:27015" là định dạng DUY NHẤT được cả hai phía (C và Rust) hiểu
+  # đúng cùng một nghĩa (TCP), nên đó là giá trị ta luôn chuẩn hoá về.
+  local desired="127.0.0.1:$TCP_PORT"
+  local changed=0
+  local rc
+  for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+    [[ -f "$rc" ]] || continue
+    local current
+    current=$(grep -E '^[[:space:]]*export[[:space:]]+USBMUXD_SOCKET_ADDRESS=' "$rc" 2>/dev/null | tail -n1 | sed -E 's/^[[:space:]]*export[[:space:]]+USBMUXD_SOCKET_ADDRESS=//')
+    if [[ -z "$current" ]]; then
+      continue # không có dòng nào, để install.sh/người dùng tự thêm nếu cần
+    fi
+    if [[ "$current" != "$desired" ]]; then
+      sed -i '/USBMUXD_SOCKET_ADDRESS/d' "$rc"
+      sed -i '/# termux-usbmuxd configuration/d' "$rc"
+      {
+        echo ""
+        echo "# termux-usbmuxd configuration"
+        echo "export USBMUXD_SOCKET_ADDRESS=$desired"
+      } >> "$rc"
+      log_warn "Đã sửa USBMUXD_SOCKET_ADDRESS trong $rc (cũ: '$current' -> mới: '$desired')"
+      changed=1
+    fi
+  done
+  if [[ $changed -eq 1 ]]; then
+    log_warn "Thay đổi trên chỉ áp dụng cho phiên shell MỚI. Với phiên đang mở, chạy ngay:"
+    log_warn "  export USBMUXD_SOCKET_ADDRESS=$desired"
+    log_warn "hoặc đóng mở lại tab Termux / chạy: source ~/.bashrc"
+  fi
+}
+
 get_devices() {
-  termux-usb -l 2>/dev/null | jq -r '.[]' 2>/dev/null || echo ""
+  # timeout guards against termux-usb hanging forever when the Termux:API
+  # service is stuck servicing a device that's still claimed by a previous
+  # "-e" session (see cleanup_old_processes below for why that happens)
+  timeout 8 termux-usb -l 2>/dev/null | jq -r '.[]' 2>/dev/null || echo ""
+}
+
+cleanup_old_processes() {
+  # IMPORTANT: usbmuxd/usbmuxd_proxy are not the only things holding the USB
+  # device open. The background "termux-usb -E -e ..." call from a previous
+  # start_usbmuxd() run keeps the USB file descriptor claimed until that
+  # exact process is killed - if it's left running, the NEXT scan
+  # (termux-usb -l) will hang indefinitely waiting on Termux:API, which is
+  # what caused "Scanning USB devices..." to hang on your second "1".
+  pkill -x "usbmuxd" || true
+  pkill -x "usbmuxd_proxy" || true
+  pkill -f "termux-usb .*-e " || true
+  pkill -x "socat" || true
+  # If a previous run was killed abruptly (OOM, force-close, crash) the
+  # Unix socket file can be left behind. usbmuxd_proxy also unlinks it as
+  # a second line of defense, but we clean it up here too so `termux-usbmuxd
+  # status` and manual checks (e.g. `[[ -S "$SOCKET" ]]`) don't see a stale,
+  # unconnectable socket file before the new daemon has started.
+  rm -f "$SOCKET"
+  # Give Termux:API a moment to actually release the device before we
+  # request it again.
+  sleep 1
 }
 
 start_usbmuxd() {
   local device=${1:-""}
-  
+
+  if pgrep -x "usbmuxd" > /dev/null; then
+    log_warn "usbmuxd is already running - not rescanning."
+    log_warn "Use option 2 (Stop) first if you need to reconnect/rescan the device."
+    return 0
+  fi
+
+  # Prevent Android from killing/suspending Termux while we hold the USB
+  # session open in the background (this is the likely cause of the
+  # "shell-init: error retrieving current directory" crash you hit).
+  command -v termux-wake-lock >/dev/null 2>&1 && termux-wake-lock
+
+  cleanup_old_processes
+
   if [[ -z "$device" ]]; then
 
 log_info "Scanning USB devices..."
@@ -49,9 +137,10 @@ device=$(get_devices | head -n 1)
 
 if [[ -z "$device" ]]; then
 
-log_error "iPhone not found. Please plug in OTG cable."
+log_error "iPhone not found (scan timed out or no device authorized)."
+log_error "Checklist: cable supports data (not charge-only), Termux:API app installed & not battery-restricted, device unlocked and 'Trust This Computer' accepted."
 
-exit 1
+return 1
 
 fi
 
@@ -59,17 +148,7 @@ fi
 
 log_info "Requesting permission for $device..."
 
-termux-usb -r "$device" || { log_error "Permission denied."; exit 1; }
-
-# FIX: Use -x instead of -f to avoid accidentally killing this script
-
-log_info "Cleaning up old processes..."
-
-pkill -x "usbmuxd" || true
-
-pkill -x "usbmuxd_proxy" || true
-
-rm -f "$SOCKET" "$PIDFILE"
+termux-usb -r "$device" || { log_error "Permission denied."; return 1; }
 
 log_info "Starting the usbmuxd daemon..."
 
@@ -78,19 +157,6 @@ mkdir -p "$(dirname "$SOCKET")"
 # Start the background daemon and redirect the log
 
 nohup termux-usb -E -e "$PROXY_BIN $PROXY_ARGS --pidfile $PIDFILE" "$device" >> "$LOGFILE" 2>&1 &
-
-# Wait for the socket to appear (maximum 10 seconds)
-
-local timeout=10
-
-while [[ $timeout -gt 0 ]]; do
-
-if [[ -S "$SOCKET" || $(netstat -tuln | grep ":$TCP_PORT ") ]]; then break; fi
-
-sleep 1
-
-((timeout--))
-done
 
 # Wait for the sockets to appear (maximum 10 seconds)
 local timeout=10
@@ -112,22 +178,30 @@ else
     log_warn "usbmuxd TCP socket NOT ready (check if 'socat' is installed)."
 fi
 
-if [[ ! -S "$SOCKET" && ! $(netstat -tuln | grep -q ":$TCP_PORT ") ]]; then
+if [[ ! -S "$SOCKET" ]] && ! netstat -tuln | grep -q ":$TCP_PORT "; then
     log_error "Startup failed. Neither Unix nor TCP socket is ready."
     log_error "Check log: cat $LOGFILE"
-    exit 1
+    return 1
 fi
+
+# Reminder for standalone Rust binaries (e.g. idevice-tools) run from a
+# different shell/session than this one: they read USBMUXD_SOCKET_ADDRESS
+# from THEIR OWN environment, not from this script's export. Run option 5 /
+# 'termux-usbmuxd doctor' if you see "Bad USBMUXD_SOCKET_ADDRESS" from them.
+log_info "For standalone tools (e.g. ./idevice-tools), make sure THIS shell also has:"
+log_info "  export USBMUXD_SOCKET_ADDRESS=127.0.0.1:$TCP_PORT"
+log_info "(run 'termux-usbmuxd doctor' if idevice-tools reports 'Bad USBMUXD_SOCKET_ADDRESS')"
 }
 
 stop_usbmuxd() {
 
 log_info "Stopping usbmuxd..."
 
-pkill -x "usbmuxd" || true
-
-pkill -x "usbmuxd_proxy" || true
+cleanup_old_processes
 
 rm -f "$SOCKET" "$PIDFILE"
+
+command -v termux-wake-unlock >/dev/null 2>&1 && termux-wake-unlock
 
 log_info "Stopped."
 
@@ -160,6 +234,8 @@ echo "3) Pair"
 
 echo "4) View info"
 
+echo "5) Fix shell config (USBMUXD_SOCKET_ADDRESS)"
+
 echo "q) Exit"
 
 echo -n "Select: "
@@ -167,24 +243,32 @@ read -r opt
 
 case $opt in
 
-1) start_usbmuxd ;;
+1) start_usbmuxd || log_warn "Start failed - see messages above." ;;
 
-2) stop_usbmuxd ;;
+2) stop_usbmuxd || true ;;
 
-3) idevicepair pair ;;
+3) idevicepair pair || log_warn "Pairing failed - is the device unlocked and usbmuxd running?" ;;
 
-4) ideviceinfo ;;
+4) ideviceinfo || log_warn "Could not get device info - is usbmuxd running (option 1) and the device connected?" ;;
+
+5) fix_shell_rc; log_info "Kiểm tra xong. Nếu ở trên có dòng [WARN], nhớ chạy 'source ~/.bashrc' hoặc mở tab Termux mới trước khi dùng idevice-tools/idevicepair ngoài menu này." ;;
 
 q) exit 0 ;;
 esac
   done
 }
 
+# Self-heal known-bad USBMUXD_SOCKET_ADDRESS values in shell rc files on every
+# invocation (not just at install time), so drift from other guides/older
+# installs gets corrected automatically. Safe/no-op if nothing is wrong.
+fix_shell_rc
+
 if [[ $# -eq 0 ]]; then interactive_menu; exit 0; fi
 case "$1" in
   start) start_usbmuxd ;;
   stop) stop_usbmuxd ;;
-  pair) ideapair pair ;;
-  info) ideaviceinfo ;;
+  pair) idevicepair pair ;;
+  info) ideviceinfo ;;
+  doctor) fix_shell_rc; log_info "USBMUXD_SOCKET_ADDRESS mong muốn: 127.0.0.1:$TCP_PORT" ;;
   *) interactive_menu ;;
 esac

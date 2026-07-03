@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
 
 /**
  * usbmuxd_proxy: Wrapper duy trì File Descriptor USB
@@ -89,6 +90,17 @@ int main(int argc, char *argv[]) {
     }
     usbmuxd_argv[j] = NULL;
 
+    // Nếu còn sót lại file socket từ lần chạy trước bị crash/kill đột ngột,
+    // usbmuxd sẽ bind() thất bại (Address already in use) và không tạo lại
+    // được socket mới. Dọn dẹp file cũ trước khi khởi động để tránh lỗi này.
+    if (unix_socket_path) {
+        struct stat st;
+        if (stat(unix_socket_path, &st) == 0) {
+            fprintf(stderr, "usbmuxd_proxy: Removing stale socket file at %s\n", unix_socket_path);
+            unlink(unix_socket_path);
+        }
+    }
+
     fprintf(stderr, "usbmuxd_proxy: Starting usbmuxd...\n");
     pid_t pid = fork();
 
@@ -102,8 +114,19 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "usbmuxd_proxy: Starting TCP forwarder on port %s -> %s\n", tcp_port, unix_socket_path);
             pid_t socat_pid = fork();
             if (socat_pid == 0) {
-                // Chờ usbmuxd tạo socket
-                sleep(2);
+                // Chờ usbmuxd thực sự tạo xong Unix socket thay vì sleep() cố định:
+                // trên máy chậm 2 giây có thể chưa đủ (socat sẽ exec lỗi và không
+                // tự thử lại), còn trên máy nhanh thì lãng phí thời gian khởi động.
+                struct stat st;
+                int waited_ms = 0;
+                const int max_wait_ms = 8000;
+                while (stat(unix_socket_path, &st) != 0 && waited_ms < max_wait_ms) {
+                    usleep(100 * 1000); // 100ms
+                    waited_ms += 100;
+                }
+                if (stat(unix_socket_path, &st) != 0) {
+                    fprintf(stderr, "usbmuxd_proxy: WARNING: Unix socket %s did not appear after %dms, starting socat anyway\n", unix_socket_path, max_wait_ms);
+                }
                 char tcp_addr[64];
                 snprintf(tcp_addr, sizeof(tcp_addr), "TCP4-LISTEN:%s,reuseaddr,fork", tcp_port);
                 char unix_addr[256];

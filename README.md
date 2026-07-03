@@ -63,6 +63,7 @@ This project provides a robust solution for running `usbmuxd` on Termux without 
 -   **`termux-usbmuxd status`**: Shows the current status of `usbmuxd`, indicating if Unix and/or TCP sockets are active.
 -   **`termux-usbmuxd pair`**: Initiates the pairing process with your iOS device (uses `idevicepair pair`).
 -   **`termux-usbmuxd info`**: Displays information about your connected iOS device (uses `ideviceinfo`).
+-   **`termux-usbmuxd doctor`**: Checks `~/.bashrc`/`~/.zshrc` for a stale or incompatible `USBMUXD_SOCKET_ADDRESS` (e.g. an old `UNIX:/path` value) and rewrites it to the correct `127.0.0.1:27015` TCP form. Also runs automatically, silently, every time `termux-usbmuxd` starts.
 
 ## Troubleshooting
 
@@ -71,6 +72,14 @@ This project provides a robust solution for running `usbmuxd` on Termux without 
 -   **"Startup failed. Please check the log: cat ~/.termux-usbmuxd.log"**: Examine the log file for detailed error messages. This log file is crucial for diagnosing issues.
 -   **Socket errors with `idevice` tools**: With the new dual-socket support, most tools should now connect automatically. If you still encounter issues, ensure `USBMUXD_SOCKET_ADDRESS` is correctly set in your `~/.bashrc` (it should point to the Unix socket by default, but tools can still connect to the TCP port).
 -   **`idevicepair pair` fails**: Ensure `usbmuxd` is running (`termux-usbmuxd status` should show RUNNING for at least one socket). Try restarting `termux-usbmuxd` and then `idevicepair pair` again. Make sure your iOS device is unlocked and trusts the computer.
+-   **`./idevice-tools pair` (or any other Rust `idevice-tools` subcommand) crashes with `thread 'main' panicked ... Bad USBMUXD_SOCKET_ADDRESS: AddrParseError(Socket)`**: This means your **current shell** has `USBMUXD_SOCKET_ADDRESS` set to something the Rust `idevice` crate can't parse - most commonly a leftover `UNIX:$PREFIX/var/run/usbmuxd` value from an older install of this project or from a classic libimobiledevice tutorial. That syntax is correct for `ideviceinfo`/`idevicepair` (C, libimobiledevice) but the Rust crate does **not** understand the `UNIX:` prefix at all: if the value contains a `:` it must be a plain, strictly valid `host:port` TCP address, nothing else.
+    - Fix it for new shells: run `termux-usbmuxd doctor` (or menu option `5`). It rewrites `~/.bashrc`/`~/.zshrc` to the correct `export USBMUXD_SOCKET_ADDRESS=127.0.0.1:27015`.
+    - Fix it for the shell you're in *right now* (rc-file changes don't retroactively affect an already-running shell): run
+      ```bash
+      export USBMUXD_SOCKET_ADDRESS=127.0.0.1:27015
+      ```
+      or simply close the Termux tab/session and open a new one, then retry.
+    - `127.0.0.1:27015` (the TCP port that `termux-usbmuxd` bridges to the real Unix socket via `socat`) is the only value understood identically by both the C tools and the Rust tools, so don't switch it back to a `UNIX:` path.
 
 ## Contributing
 

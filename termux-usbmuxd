@@ -4,7 +4,7 @@
 #
 set -euo pipefail
 
-SOCKET="$PREFIX/var/run/usbmuxd"
+SOCKET="$PREFIX/data/user/0/com.termux/files/usr/var/run/usbmuxd"
 TCP_PORT="${USBMUXD_TCP_PORT:-27015}" # Default TCP port, can be overridden by environment variable
 
 # Ensure USBMUXD_TCP_PORT is set for the script, even if empty

@@ -1,6 +1,6 @@
 # termux-usbmuxd
 
-## Rootless usbmuxd management for Termux (Absolutely Stable Version)
+## Rootless usbmuxd management for Termux 
 
 This project provides a robust solution for running `usbmuxd` on Termux without root access, enabling various `libimobiledevice` tools to interact with iOS devices. This version includes enhancements for better stability, compatibility, and automatic support for both Unix and TCP sockets.
 
@@ -50,7 +50,7 @@ This project provides a robust solution for running `usbmuxd` on Termux without 
 ## Usage
 Command to run Termux-usbmuxd
 ```bash
-    termux-usbmuxd
+termux-usbmuxd
 ```
 After run command you will see a menu function termux-usbmuxd
 ### Quick Start

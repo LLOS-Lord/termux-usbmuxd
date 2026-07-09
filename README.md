@@ -21,16 +21,11 @@ This project provides a robust solution for running `usbmuxd` on Termux without 
 
 ## Installation
 
-1.  **Clone the repository:**
+1.  **Clone the repository and setup enviroment:**
 
     ```bash
     git clone https://github.com/LLOS-Lord/termux-usbmuxd.git
     cd termux-usbmuxd
-    ```
-
-2.  **Run the installation script:**
-
-    ```bash
     bash install.sh
     ```
 

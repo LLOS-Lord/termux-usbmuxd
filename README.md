@@ -51,7 +51,7 @@ This project provides a robust solution for running `usbmuxd` on Termux without 
 Command to run Termux-usbmuxd
 ```bash
     termux-usbmuxd
-    ```
+```
 After run command you will see a menu function termux-usbmuxd
 ### Quick Start
 

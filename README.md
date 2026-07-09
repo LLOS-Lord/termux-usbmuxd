@@ -20,7 +20,9 @@ This project provides a robust solution for running `usbmuxd` on Termux without 
 - An iOS device and a USB-OTG cable.
 
 ## Installation
-
+1.  **Install termux and termux api:**
+- Link termux : https://f-droid.org/repo/com.termux_1022.apk
+- Link termux api : https://apkpure.com/termux-api/com.termux.api/download
 1.  **Clone the repository and setup enviroment:**
 
     ```bash

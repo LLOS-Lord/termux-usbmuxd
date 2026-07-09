@@ -48,7 +48,11 @@ This project provides a robust solution for running `usbmuxd` on Termux without 
     ```
 
 ## Usage
-Run termux-usbmuxd 
+Command to run Termux-usbmuxd
+```bash
+    termux-usbmuxd
+    ```
+After run command you will see a menu function termux-usbmuxd
 ### Quick Start
 
 1.  Connect your iPhone via USB-OTG cable to your Android device.

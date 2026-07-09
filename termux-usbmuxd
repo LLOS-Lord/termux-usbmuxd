@@ -224,7 +224,7 @@ fi
 interactive_menu() {
 while true; do
 
-echo -e "\n${BLUE}=== Termux-Usbmuxd Pro (Stable) ===${NC}"
+echo -e "\n${BLUE}=== Termux-Usbmuxd ===${NC}"
 
 echo "1) Start usbmuxd"
 
@@ -247,11 +247,11 @@ case $opt in
 
 2) stop_usbmuxd || true ;;
 
-3) idevicepair pair || log_warn "Pairing failed - is the device unlocked and usbmuxd running?" ;;
+3) idevicepair pair || log_warn "Pairing failed - is the device unlocked and usbmuxd running or trusted connect ?" ;;
 
-4) ideviceinfo || log_warn "Could not get device info - is usbmuxd running (option 1) and the device connected?" ;;
+4) ideviceinfo || log_warn "Could not get device info - is usbmuxd running (option 1) and the device connected or trusted connect ?" ;;
 
-5) fix_shell_rc; log_info "Kiểm tra xong. Nếu ở trên có dòng [WARN], nhớ chạy 'source ~/.bashrc' hoặc mở tab Termux mới trước khi dùng idevice-tools/idevicepair ngoài menu này." ;;
+5) fix_shell_rc; log_info "Check complete. If you see a [WARN] line above, remember to run 'source ~/.bashrc' or open a new Termux tab before using idevice-tools/idevicepair outside of this menu." ;;
 
 q) exit 0 ;;
 esac

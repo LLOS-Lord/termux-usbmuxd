@@ -31,7 +31,7 @@ This project provides a robust solution for running `usbmuxd` on Termux without 
 2.  **Run the installation script:**
 
     ```bash
-    ./install.sh
+    bash install.sh
     ```
 
     This script will:

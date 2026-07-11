@@ -5,7 +5,7 @@ echo "==> Installing improved termux-usbmuxd..."
 
 echo "    Installing dependencies..."
 pkg update && pkg upgrade -y
-pkg install -y usbmuxd libimobiledevice which termux-api build-essential clang python jq libzip socat
+pkg install -y usbmuxd libimobiledevice which termux-api build-essential clang python jq libzip python-pip socat
 
 git clone https://github.com/LLOS-Lord/ideviceinstaller.git
 cd ideviceinstaller

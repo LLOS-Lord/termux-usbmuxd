@@ -22,7 +22,7 @@ This project provides a robust solution for running `usbmuxd` on Termux without 
 ## Installation
 1.  **Install termux and termux api:**
 - [Termux](https://f-droid.org/repo/com.termux_1022.apk) (from F-Droid)
-- [Termux:API](https://data.winudf.com/APK/Y29tLnRlcm11eC5hcGlfNTFfZmMzMGJlYzc?_p=Y29tLnRlcm11eC5hcGk%3D&download_id=otr_1086709788379560&filename=Termux%3AAPI_0.50.1_APKPure.apk&full_size=7176273&is_hot=false&k=53fbac7edf61870325e5109d7f9573556a526b72&package_name=com.termux.api&source=web&token=1783613554-a1236c72f1-0-7529521498c8764a089ff8cd6a48d830) (from ApkPure)
+- [Termux:API](https://f-droid.org/repo/com.termux.api_1002.apk) (from F-Droid)
 2.  **Clone the repository and setup enviroment:**
 
     ```bash

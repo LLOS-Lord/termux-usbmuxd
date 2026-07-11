@@ -26,6 +26,7 @@ This project provides a robust solution for running `usbmuxd` on Termux without 
 2.  **Clone the repository and setup enviroment:**
 
     ```bash
+    pkg install git
     git clone https://github.com/LLOS-Lord/termux-usbmuxd.git
     cd termux-usbmuxd
     bash install.sh

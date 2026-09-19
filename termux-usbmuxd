@@ -2,16 +2,57 @@
 #
 # termux-usbmuxd - Rootless usbmuxd management (Absolutely Stable Version)
 #
+# RELIABILITY RELEASE - fixes "[ERROR] iPhone not found (scan timed out or no
+# device authorized)" happening on most connection attempts:
+#
+#   1. The scan is retried (SCAN_ATTEMPTS x SCAN_DELAY) instead of a single
+#      8s attempt that gave up while the Termux:API service was still cold.
+#   2. The iPhone is located through /sys/bus/usb/devices (idVendor 05ac)
+#      first - fast and independent of the Termux:API service - then matched
+#      against `termux-usb -l`, so another USB device can never be picked by
+#      mistake and a slow/hung `termux-usb -l` no longer means "no device".
+#   3. A stale usbmuxd (left over from a previous USB session after a replug)
+#      is detected with idevice_id -l and restarted automatically instead of
+#      blocking every new start with "usbmuxd is already running".
+#   4. Leftover processes are killed AND waited for, so the USB file
+#      descriptor is really released before the device is opened again.
+#   5. The TCP readiness check reads /proc/net/tcp directly: the old
+#      `netstat` check silently failed on every default install because
+#      install.sh never installed net-tools.
+#   6. The USB permission request has a timeout and retries, so a missed
+#      Android popup no longer kills the whole start.
+#   7. After the daemon is up, idevice_id -l verifies the iPhone is actually
+#      attached before Start reports success.
+#
 set -euo pipefail
 
 SOCKET="$PREFIX/var/run/usbmuxd"
 TCP_PORT="${USBMUXD_TCP_PORT:-27015}" # Default TCP port, can be overridden by environment variable
-
-# Ensure USBMUXD_TCP_PORT is set for the script, even if empty
-: ${USBMUXD_TCP_PORT:=}
 PIDFILE="$PREFIX/var/run/usbmuxd.pid"
 LOGFILE="$HOME/.termux-usbmuxd.log"
 PROXY_BIN="$PREFIX/bin/usbmuxd_proxy"
+
+# Reliability knobs (override via environment, e.g. SCAN_ATTEMPTS=10 termux-usbmuxd start)
+SCAN_ATTEMPTS="${SCAN_ATTEMPTS:-6}"      # scan rounds before giving up
+SCAN_DELAY="${SCAN_DELAY:-2}"            # seconds between scan rounds
+USBSCAN_TIMEOUT="${USBSCAN_TIMEOUT:-8}"  # per-round timeout for termux-usb -l
+START_WAIT="${START_WAIT:-20}"           # seconds to wait for the daemon sockets
+PERM_ATTEMPTS="${PERM_ATTEMPTS:-3}"      # USB permission request attempts
+VERIFY_ATTEMPTS="${VERIFY_ATTEMPTS:-10}" # idevice_id -l retries after start
+
+[[ "$TCP_PORT" =~ ^[0-9]+$ ]] || {
+  echo "[ERROR] USBMUXD_TCP_PORT must be numeric, got '$TCP_PORT'" >&2
+  exit 1
+}
+# Validate every reliability knob: a garbage override like SCAN_ATTEMPTS=abc
+# would otherwise explode later inside "for ((...))" under set -e, far from
+# the actual mistake.
+for knob in SCAN_ATTEMPTS SCAN_DELAY USBSCAN_TIMEOUT START_WAIT PERM_ATTEMPTS VERIFY_ATTEMPTS; do
+  [[ "${!knob}" =~ ^[0-9]+$ ]] || {
+    echo "[ERROR] $knob must be numeric, got '${!knob}'" >&2
+    exit 1
+  }
+done
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -19,9 +60,11 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
-log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
-log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+# Logs go to STDERR on purpose: start_usbmuxd() captures the stdout of the
+# scan helper with $(...); a stdout log line would corrupt the device path.
+log_info() { echo -e "${GREEN}[INFO]${NC} $1" >&2; }
+log_warn() { echo -e "${YELLOW}[WARN]${NC} $1" >&2; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1" >&2; }
 
 # Export default environment variables
 # NOTE: Rust-based tools (e.g. idevice-tools / jkcoxson's "idevice" crate) parse this
@@ -61,7 +104,11 @@ fix_shell_rc() {
   for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
     [[ -f "$rc" ]] || continue
     local current
-    current=$(grep -E '^[[:space:]]*export[[:space:]]+USBMUXD_SOCKET_ADDRESS=' "$rc" 2>/dev/null | tail -n1 | sed -E 's/^[[:space:]]*export[[:space:]]+USBMUXD_SOCKET_ADDRESS=//')
+    # The "|| true" guards `set -euo pipefail`: when the rc file has no
+    # USBMUXD_SOCKET_ADDRESS line, grep exits 1 and pipefail would turn the
+    # assignment into a failing command, silently aborting the whole script
+    # before the menu is ever shown.
+    current=$(grep -E '^[[:space:]]*export[[:space:]]+USBMUXD_SOCKET_ADDRESS=' "$rc" 2>/dev/null | tail -n1 | sed -E 's/^[[:space:]]*export[[:space:]]+USBMUXD_SOCKET_ADDRESS=//') || true
     if [[ -z "$current" ]]; then
       continue # không có dòng nào, để install.sh/người dùng tự thêm nếu cần
     fi
@@ -84,11 +131,68 @@ fix_shell_rc() {
   fi
 }
 
+require_tools() {
+  local missing=""
+  command -v termux-usb >/dev/null 2>&1 || missing="$missing termux-usb"
+  command -v jq >/dev/null 2>&1 || missing="$missing jq"
+  command -v timeout >/dev/null 2>&1 || missing="$missing timeout"
+  if [[ -n "$missing" ]]; then
+    log_error "Missing required command(s):$missing"
+    log_error "Fix with: pkg install termux-api jq coreutils"
+    log_error "Note: the 'termux-api' PACKAGE is not enough - the Termux:API ANDROID APP must be installed too."
+    return 1
+  fi
+}
+
+# Fast, Termux:API-independent presence check. Android exposes every USB
+# device under /sys/bus/usb/devices with world-readable idVendor/busnum/devnum
+# files; Apple's vendor id is 05ac. Echoes the matching /dev/bus/usb path.
+sysfs_apple_device() {
+  local dir vid busnum devnum
+  for dir in /sys/bus/usb/devices/*; do
+    [[ -f "$dir/idVendor" ]] || continue
+    vid=$(cat "$dir/idVendor" 2>/dev/null) || continue
+    [[ "$vid" == "05ac" ]] || continue
+    busnum=$(cat "$dir/busnum" 2>/dev/null) || continue
+    devnum=$(cat "$dir/devnum" 2>/dev/null) || continue
+    printf '/dev/bus/usb/%03d/%03d\n' "$busnum" "$devnum"
+    return 0
+  done
+  return 1
+}
+
+# True when /sys/bus/usb/devices is readable AND actually exposes idVendor
+# files (some heavily restricted ROMs hide sysfs from apps).
+sysfs_usable() {
+  local d
+  [[ -d /sys/bus/usb/devices && -r /sys/bus/usb/devices ]] || return 1
+  for d in /sys/bus/usb/devices/*; do
+    [[ -f "$d/idVendor" ]] && return 0
+  done
+  return 1
+}
+
+# /dev/bus/usb/001/002 -> "1:2": zero-padding-tolerant comparison form.
+norm_usb_path() {
+  local p=${1:-}
+  [[ "$p" =~ ^/dev/bus/usb/0*([0-9]+)/0*([0-9]+)$ ]] || return 1
+  printf '%d:%d\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+}
+
+# List devices as Termux:API sees them. It can hang while the service is busy
+# or is still releasing a previous session, hence the timeout guard.
 get_devices() {
-  # timeout guards against termux-usb hanging forever when the Termux:API
-  # service is stuck servicing a device that's still claimed by a previous
-  # "-e" session (see cleanup_old_processes below for why that happens)
-  timeout 8 termux-usb -l 2>/dev/null | jq -r '.[]' 2>/dev/null || echo ""
+  timeout "$USBSCAN_TIMEOUT" termux-usb -l 2>/dev/null | jq -r '.[]' 2>/dev/null || true
+}
+
+tcp_listening() {
+  # True when something is in LISTEN (state 0A) on $TCP_PORT according to
+  # /proc/net/tcp(6). Replaces the old `netstat` check that always failed on
+  # default installs because net-tools was never installed.
+  local hp
+  hp=$(printf '%04X' "$TCP_PORT")
+  grep -qiE ":$hp[[:space:]]+[^[:space:]]+[[:space:]]+0A[[:space:]]" /proc/net/tcp 2>/dev/null && return 0
+  grep -qiE ":$hp[[:space:]]+[^[:space:]]+[[:space:]]+0A[[:space:]]" /proc/net/tcp6 2>/dev/null
 }
 
 cleanup_old_processes() {
@@ -96,165 +200,294 @@ cleanup_old_processes() {
   # device open. The background "termux-usb -E -e ..." call from a previous
   # start_usbmuxd() run keeps the USB file descriptor claimed until that
   # exact process is killed - if it's left running, the NEXT scan
-  # (termux-usb -l) will hang indefinitely waiting on Termux:API, which is
-  # what caused "Scanning USB devices..." to hang on your second "1".
+  # (termux-usb -l) will hang indefinitely waiting on Termux:API.
   pkill -x "usbmuxd" || true
   pkill -x "usbmuxd_proxy" || true
   pkill -f "termux-usb .*-e " || true
+  pkill -x "termux-usb" || true
   pkill -x "socat" || true
-  # If a previous run was killed abruptly (OOM, force-close, crash) the
-  # Unix socket file can be left behind. usbmuxd_proxy also unlinks it as
-  # a second line of defense, but we clean it up here too so `termux-usbmuxd
-  # status` and manual checks (e.g. `[[ -S "$SOCKET" ]]`) don't see a stale,
-  # unconnectable socket file before the new daemon has started.
-  rm -f "$SOCKET"
-  # Give Termux:API a moment to actually release the device before we
-  # request it again.
+  # If a previous run was killed abruptly (OOM, force-close, crash) the Unix
+  # socket file can be left behind and make bind() fail with "Address already
+  # in use". Remove it (and any stale pidfile) before starting again.
+  rm -f "$SOCKET" "$PIDFILE"
+  # SIGTERM is asynchronous: wait until the killed processes are really gone
+  # so the USB FD is actually released before the device is opened again.
+  local i=0
+  while (( i < 10 )); do
+    if ! pgrep -x "usbmuxd" >/dev/null 2>&1 && ! pgrep -x "usbmuxd_proxy" >/dev/null 2>&1; then
+      break
+    fi
+    sleep 0.5
+    i=$((i + 1))
+  done
+  # Give Termux:API a moment to notice the closed connection and hand the
+  # device back to Android before we request it again.
   sleep 1
+}
+
+# Multi-attempt device discovery. Echoes the device path on stdout (logs go
+# to stderr) and returns 0 on success, 1 when no iPhone could be located.
+find_iphone() {
+  local i sysdev listed line sysnorm devnorm match
+  for (( i = 1; i <= SCAN_ATTEMPTS; i++ )); do
+    if (( i > 1 )); then
+      log_info "Scan attempt $i/$SCAN_ATTEMPTS..."
+      sleep "$SCAN_DELAY"
+    fi
+
+    sysdev=$(sysfs_apple_device || true)
+    if [[ -n "$sysdev" ]]; then
+      listed=$(get_devices)
+      match=0
+      sysnorm=$(norm_usb_path "$sysdev" 2>/dev/null) || sysnorm=""
+      if [[ -n "$listed" && -n "$sysnorm" ]]; then
+        while IFS= read -r line; do
+          [[ -z "$line" ]] && continue
+          devnorm=$(norm_usb_path "$line" 2>/dev/null) || continue
+          if [[ "$sysnorm" == "$devnorm" ]]; then
+            match=1
+            # Return exactly the path string Termux:API itself reported.
+            printf '%s\n' "$line"
+            break
+          fi
+        done <<< "$listed"
+      fi
+      if [[ $match -eq 1 ]]; then
+        return 0
+      fi
+      log_warn "iPhone is present at $sysdev, but termux-usb -l does not list it yet (Termux:API busy or still releasing the previous session)..."
+      continue
+    fi
+
+    # sysfs shows no Apple device. If sysfs is usable that verdict is final
+    # for this round: whatever termux-usb lists is a hub/flash drive/...,
+    # never the iPhone.
+    listed=$(get_devices)
+    if [[ -n "$listed" ]] && ! sysfs_usable; then
+      # sysfs is not readable on this ROM - fall back to the legacy behavior
+      # of taking the first device Termux:API reports.
+      log_warn "Cannot read /sys/bus/usb/devices on this ROM - falling back to the first device reported by termux-usb."
+      line=$(printf '%s\n' "$listed" | head -n 1)
+      printf '%s\n' "$line"
+      return 0
+    fi
+    # No Apple device yet - wait for the (re)plug and scan again.
+  done
+
+  # Last chance: sysfs still sees the iPhone although termux-usb -l never
+  # answered in time. The path layout is identical, so try it anyway.
+  sysdev=$(sysfs_apple_device || true)
+  if [[ -n "$sysdev" ]]; then
+    log_warn "termux-usb -l never listed the iPhone in time; continuing with $sysdev from sysfs."
+    printf '%s\n' "$sysdev"
+    return 0
+  fi
+
+  if sysfs_usable; then
+    log_error "iPhone not found after $SCAN_ATTEMPTS scan attempts (Android sees no Apple USB device at all)."
+    log_error "Checklist: cable supports data (not charge-only), OTG adapter works, iPhone unlocked."
+    log_error "Unplug/replug the cable once, then run Start again."
+  else
+    log_error "iPhone not found after $SCAN_ATTEMPTS scan attempts."
+    log_error "termux-usb -l returned nothing. Checklist: cable supports data (not charge-only),"
+    log_error "Termux:API APP installed & not battery-restricted, device unlocked, 'Trust This Computer' accepted."
+  fi
+  return 1
+}
+
+request_permission() {
+  local device=$1
+  local i
+  for (( i = 1; i <= PERM_ATTEMPTS; i++ )); do
+    log_info "Requesting USB permission for $device (attempt $i/$PERM_ATTEMPTS)..."
+    if timeout 30 termux-usb -r "$device"; then
+      return 0
+    fi
+    log_warn "Permission not confirmed yet - if Android shows a USB popup for Termux, tap Allow/OK."
+    sleep 2
+  done
+  log_error "Could not get USB permission for $device."
+  log_error "The device may have been unplugged/replugged (permissions reset) - run Start again to rescan."
+  return 1
+}
+
+# True when a running usbmuxd actually serves a visible iPhone.
+daemon_healthy() {
+  pgrep -x "usbmuxd" >/dev/null 2>&1 || return 1
+  [[ -S "$SOCKET" ]] || return 1
+  command -v idevice_id >/dev/null 2>&1 || return 1
+  USBMUXD_SOCKET_ADDRESS="UNIX:$SOCKET" timeout 5 idevice_id -l 2>/dev/null | grep -q .
+}
+
+start_daemon() {
+  local device=$1
+  mkdir -p "$(dirname "$SOCKET")"
+  log_info "Starting the usbmuxd daemon for $device..."
+  nohup termux-usb -E -e "$PROXY_BIN $PROXY_ARGS --pidfile $PIDFILE" "$device" >> "$LOGFILE" 2>&1 &
+
+  # Wait for the sockets to appear. If usbmuxd/proxy die early, cut the wait
+  # short instead of stalling for the full window.
+  local waited=0
+  while (( waited < START_WAIT )); do
+    if [[ -S "$SOCKET" ]] && tcp_listening; then
+      break
+    fi
+    if (( waited >= 6 )) && ! pgrep -x "usbmuxd" >/dev/null 2>&1 && ! pgrep -x "usbmuxd_proxy" >/dev/null 2>&1; then
+      log_warn "usbmuxd/proxy processes are gone before their sockets appeared."
+      break
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+
+  if [[ -S "$SOCKET" ]]; then
+    log_info "usbmuxd Unix socket is ready at $SOCKET"
+  else
+    log_warn "usbmuxd Unix socket NOT ready."
+  fi
+  if tcp_listening; then
+    log_info "usbmuxd TCP socket is ready at 127.0.0.1:$TCP_PORT"
+  else
+    log_warn "usbmuxd TCP socket NOT ready (check if 'socat' is installed)."
+  fi
+  if [[ ! -S "$SOCKET" ]] && ! tcp_listening; then
+    log_error "Startup failed. Neither Unix nor TCP socket is ready."
+    log_error "Last lines of $LOGFILE:"
+    tail -n 15 "$LOGFILE" 2>/dev/null || true
+    return 1
+  fi
+  return 0
+}
+
+# Confirm the iPhone is really attached through usbmuxd before Start "wins".
+verify_device() {
+  command -v idevice_id >/dev/null 2>&1 || return 0
+  local i
+  for (( i = 1; i <= VERIFY_ATTEMPTS; i++ )); do
+    if USBMUXD_SOCKET_ADDRESS="UNIX:$SOCKET" timeout 5 idevice_id -l 2>/dev/null | grep -q .; then
+      log_info "iOS device is visible through usbmuxd:"
+      USBMUXD_SOCKET_ADDRESS="UNIX:$SOCKET" idevice_id -l 2>/dev/null || true
+      return 0
+    fi
+    sleep 1
+  done
+  log_warn "usbmuxd is up, but idevice_id -l shows no device yet."
+  log_warn "Unlock the iPhone; if iOS asks to 'Trust This Computer', tap Trust, then run Start again"
+  log_warn "(Start now restarts a stale daemon automatically, so retrying is cheap)."
+  return 1
 }
 
 start_usbmuxd() {
   local device=${1:-""}
 
-  if pgrep -x "usbmuxd" > /dev/null; then
-    log_warn "usbmuxd is already running - not rescanning."
-    log_warn "Use option 2 (Stop) first if you need to reconnect/rescan the device."
-    return 0
-  fi
+  require_tools || return 1
 
   # Prevent Android from killing/suspending Termux while we hold the USB
-  # session open in the background (this is the likely cause of the
-  # "shell-init: error retrieving current directory" crash you hit).
-  command -v termux-wake-lock >/dev/null 2>&1 && termux-wake-lock
+  # session open in the background.
+  command -v termux-wake-lock >/dev/null 2>&1 && termux-wake-lock || true
 
-  cleanup_old_processes
+  # A device path passed like "termux-usbmuxd start /dev/bus/usb/001/002"
+  # (documented in Step-To-Step.md) is honored; anything else triggers a scan.
+  if [[ -n "$device" && ! "$device" =~ ^/dev/bus/usb/[0-9]{3}/[0-9]{3}$ ]]; then
+    log_warn "'$device' does not look like a /dev/bus/usb/BBB/DDD path - scanning instead."
+    device=""
+  fi
+
+  # KEY FIX for "iPhone not found on most attempts": previously any
+  # already-running usbmuxd made Start refuse to rescan, so a stale daemon
+  # serving a dead USB session (after a replug) blocked every reconnect.
+  # Now it is health-checked and restarted automatically.
+  if pgrep -x "usbmuxd" >/dev/null 2>&1; then
+    if daemon_healthy; then
+      log_info "usbmuxd is already running and the iPhone is visible through it."
+      log_info "Nothing to do. If tools still fail, run option 5 (doctor) and open a NEW shell."
+      return 0
+    fi
+    log_warn "usbmuxd is running but no iPhone is visible through it - restarting it cleanly."
+    cleanup_old_processes
+  else
+    cleanup_old_processes
+  fi
 
   if [[ -z "$device" ]]; then
+    # Warm up the Termux:API service: its first plugin call after boot or
+    # after being killed is slow enough to eat a whole scan timeout. Burn it
+    # on throwaway calls so the real scan rounds are fast.
+    if command -v termux-api-start >/dev/null 2>&1; then
+      timeout 10 termux-api-start >/dev/null 2>&1 || true
+    fi
+    timeout 5 termux-usb -l >/dev/null 2>&1 || true
 
-log_info "Scanning USB devices..."
+    log_info "Scanning USB devices for an iPhone/iPad..."
+    device=$(find_iphone) || return 1
+  fi
 
-device=$(get_devices | head -n 1)
+  request_permission "$device" || { log_error "Permission denied."; return 1; }
 
-if [[ -z "$device" ]]; then
+  if ! start_daemon "$device"; then
+    log_warn "Daemon start failed once - cleaning up and retrying..."
+    cleanup_old_processes
+    request_permission "$device" || true
+    if ! start_daemon "$device"; then
+      log_error "Daemon start failed twice. Check: cat $LOGFILE"
+      return 1
+    fi
+  fi
 
-log_error "iPhone not found (scan timed out or no device authorized)."
-log_error "Checklist: cable supports data (not charge-only), Termux:API app installed & not battery-restricted, device unlocked and 'Trust This Computer' accepted."
+  verify_device || return 1
 
-return 1
-
-fi
-
-fi
-
-log_info "Requesting permission for $device..."
-
-termux-usb -r "$device" || { log_error "Permission denied."; return 1; }
-
-log_info "Starting the usbmuxd daemon..."
-
-mkdir -p "$(dirname "$SOCKET")"
-
-# Start the background daemon and redirect the log
-
-nohup termux-usb -E -e "$PROXY_BIN $PROXY_ARGS --pidfile $PIDFILE" "$device" >> "$LOGFILE" 2>&1 &
-
-# Wait for the sockets to appear (maximum 10 seconds)
-local timeout=10
-while [[ $timeout -gt 0 ]]; do
-    if [[ -S "$SOCKET" ]] && netstat -tuln | grep -q ":$TCP_PORT "; then break; fi
-    sleep 1
-    ((timeout--))
-done
-
-if [[ -S "$SOCKET" ]]; then
-    log_info "usbmuxd Unix socket is ready at $SOCKET"
-else
-    log_warn "usbmuxd Unix socket NOT ready."
-fi
-
-if netstat -tuln | grep -q ":$TCP_PORT "; then
-    log_info "usbmuxd TCP socket is ready at $TCP_PORT"
-else
-    log_warn "usbmuxd TCP socket NOT ready (check if 'socat' is installed)."
-fi
-
-if [[ ! -S "$SOCKET" ]] && ! netstat -tuln | grep -q ":$TCP_PORT "; then
-    log_error "Startup failed. Neither Unix nor TCP socket is ready."
-    log_error "Check log: cat $LOGFILE"
-    return 1
-fi
-
-# Reminder for standalone Rust binaries (e.g. idevice-tools) run from a
-# different shell/session than this one: they read USBMUXD_SOCKET_ADDRESS
-# from THEIR OWN environment, not from this script's export. Run option 5 /
-# 'termux-usbmuxd doctor' if you see "Bad USBMUXD_SOCKET_ADDRESS" from them.
-log_info "For standalone tools (e.g. ./idevice-tools), make sure THIS shell also has:"
-log_info "  export USBMUXD_SOCKET_ADDRESS=127.0.0.1:$TCP_PORT"
-log_info "(run 'termux-usbmuxd doctor' if idevice-tools reports 'Bad USBMUXD_SOCKET_ADDRESS')"
+  log_info "usbmuxd is up and the device is attached."
+  log_info "Next: if not paired yet, run option 3 (Pair) or: idevicepair pair"
+  log_info "For standalone Rust tools (e.g. ./idevice-tools), make sure THIS shell also has:"
+  log_info "  export USBMUXD_SOCKET_ADDRESS=127.0.0.1:$TCP_PORT"
+  log_info "(run 'termux-usbmuxd doctor' if idevice-tools reports 'Bad USBMUXD_SOCKET_ADDRESS')"
 }
 
 stop_usbmuxd() {
-
-log_info "Stopping usbmuxd..."
-
-cleanup_old_processes
-
-rm -f "$SOCKET" "$PIDFILE"
-
-command -v termux-wake-unlock >/dev/null 2>&1 && termux-wake-unlock
-
-log_info "Stopped."
-
+  log_info "Stopping usbmuxd..."
+  cleanup_old_processes
+  command -v termux-wake-unlock >/dev/null 2>&1 && termux-wake-unlock || true
+  log_info "Stopped."
 }
 
 show_status() {
-if pgrep -x "usbmuxd" > /dev/null; then
-
-echo -e "Status: ${GREEN}RUNNING${NC}"
-
-idevice_id -l || echo "Device not detected via socket."
-
-else
-
-echo -e "Status: ${RED}STOP${NC}"
-
-fi
+  if pgrep -x "usbmuxd" >/dev/null 2>&1; then
+    echo -e "Status: ${GREEN}RUNNING${NC}"
+    if tcp_listening; then
+      echo "TCP socket: listening on 127.0.0.1:$TCP_PORT"
+    else
+      echo "TCP socket: NOT listening"
+    fi
+    if [[ -S "$SOCKET" ]]; then
+      echo "Unix socket: $SOCKET"
+    else
+      echo "Unix socket: missing"
+    fi
+    USBMUXD_SOCKET_ADDRESS="UNIX:$SOCKET" idevice_id -l 2>/dev/null || echo "Device not detected via socket."
+  else
+    echo -e "Status: ${RED}STOP${NC}"
+  fi
 }
 
 interactive_menu() {
-while true; do
-
-echo -e "\n${BLUE}=== Termux-Usbmuxd ===${NC}"
-
-echo "1) Start usbmuxd"
-
-echo "2) Stop usbmuxd"
-
-echo "3) Pair"
-
-echo "4) View info"
-
-echo "5) Fix shell config (USBMUXD_SOCKET_ADDRESS)"
-
-echo "q) Exit"
-
-echo -n "Select: "
-read -r opt
-
-case $opt in
-
-1) start_usbmuxd || log_warn "Start failed - see messages above." ;;
-
-2) stop_usbmuxd || true ;;
-
-3) idevicepair pair || log_warn "Pairing failed - is the device unlocked and usbmuxd running or trusted connect ?" ;;
-
-4) ideviceinfo || log_warn "Could not get device info - is usbmuxd running (option 1) and the device connected or trusted connect ?" ;;
-
-5) fix_shell_rc; log_info "Check complete. If you see a [WARN] line above, remember to run 'source ~/.bashrc' or open a new Termux tab before using idevice-tools/idevicepair outside of this menu." ;;
-
-q) exit 0 ;;
-esac
+  while true; do
+    echo -e "\n${BLUE}=== Termux-Usbmuxd ===${NC}"
+    echo "1) Start usbmuxd"
+    echo "2) Stop usbmuxd"
+    echo "3) Pair"
+    echo "4) View info"
+    echo "5) Fix shell config (USBMUXD_SOCKET_ADDRESS)"
+    echo "q) Exit"
+    echo -n "Select: "
+    read -r opt
+    case $opt in
+      1) start_usbmuxd || log_warn "Start failed - see messages above." ;;
+      2) stop_usbmuxd || true ;;
+      3) idevicepair pair || log_warn "Pairing failed - is the device unlocked and usbmuxd running or trusted connect ?" ;;
+      4) ideviceinfo || log_warn "Could not get device info - is usbmuxd running (option 1) and the device connected or trusted connect ?" ;;
+      5) fix_shell_rc; log_info "Check complete. If you see a [WARN] line above, remember to run 'source ~/.bashrc' or open a new Termux tab before using idevice-tools/idevicepair outside of this menu." ;;
+      q) exit 0 ;;
+    esac
   done
 }
 
@@ -267,8 +500,23 @@ if [[ $# -eq 0 ]]; then interactive_menu; exit 0; fi
 case "$1" in
   start) start_usbmuxd ;;
   stop) stop_usbmuxd ;;
-  pair) idevicepair pair ;;
-  info) ideviceinfo ;;
-  doctor) fix_shell_rc; log_info "USBMUXD_SOCKET_ADDRESS mong muốn: 127.0.0.1:$TCP_PORT" ;;
+  status) show_status ;;
+  pair) idevicepair pair || log_warn "Pairing failed - is the device unlocked and usbmuxd running (termux-usbmuxd start) ?" ;;
+  info) ideviceinfo || log_warn "Could not get device info - is usbmuxd running (termux-usbmuxd start) ?" ;;
+  doctor)
+    fix_shell_rc
+    if tcp_listening; then
+      log_info "TCP $TCP_PORT: LISTENING"
+    else
+      log_warn "TCP $TCP_PORT: not listening (usbmuxd not running?)"
+    fi
+    if [[ -S "$SOCKET" ]]; then
+      log_info "Unix socket: present at $SOCKET"
+    else
+      log_warn "Unix socket: missing (usbmuxd not running?)"
+    fi
+    log_info "USBMUXD_SOCKET_ADDRESS mong muốn: 127.0.0.1:$TCP_PORT"
+    ;;
+  /dev/bus/usb/*) start_usbmuxd "$1" ;;
   *) interactive_menu ;;
 esac

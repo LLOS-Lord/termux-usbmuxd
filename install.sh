@@ -7,6 +7,18 @@ echo "    Installing dependencies..."
 pkg update && pkg upgrade -y
 pkg install -y usbmuxd libimobiledevice which termux-api build-essential clang python jq libzip python-pip socat
 
+echo "    Verifying required tools..."
+for tool in termux-usb jq socat usbmuxd idevice_id idevicepair timeout; do
+    command -v "$tool" >/dev/null 2>&1 || {
+        echo "ERROR: required tool '$tool' is missing after pkg install." >&2
+        if [ "$tool" = "termux-usb" ]; then
+            echo "       The 'termux-api' PACKAGE alone is not enough - the Termux:API ANDROID APP" >&2
+            echo "       must also be installed (F-Droid) and excluded from battery optimization." >&2
+        fi
+        exit 1
+    }
+done
+
 git clone https://github.com/LLOS-Lord/ideviceinstaller.git
 cd ideviceinstaller
 

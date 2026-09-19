@@ -69,7 +69,7 @@ After run command you will see a menu function termux-usbmuxd
 
 ## Troubleshooting
 
--   **"iPhone not found. Please plug in OTG cable."**: Ensure your iOS device is connected via USB-OTG and recognized by Android. Check if `termux-usb -l` lists your device.
+-   **"iPhone not found"**: Start no longer gives up after one scan. It (1) locates the iPhone directly via `/sys/bus/usb/devices` (Apple vendor id `05ac`) - fast and independent of the Termux:API service, (2) retries the scan `SCAN_ATTEMPTS` times (default 6, `SCAN_DELAY` 2s apart) while the service warms up or releases a previous USB session, and (3) reports precisely whether Android sees no Apple device at all (cable/OTG problem) or only `termux-usb -l` is slow. A stale `usbmuxd` left over from a previous replug is detected with `idevice_id -l` and restarted automatically, so running Start again is always safe and cheap. The USB permission request waits up to 30s per attempt and is retried `PERM_ATTEMPTS` (3) times - tap **Allow** on the Android popup when it appears.
 -   **"Permission denied."**: Make sure you grant USB permission to Termux when prompted by Android.
 -   **"Startup failed. Please check the log: cat ~/.termux-usbmuxd.log"**: Examine the log file for detailed error messages. This log file is crucial for diagnosing issues.
 -   **Socket errors with `idevice` tools**: With the new dual-socket support, most tools should now connect automatically. If you still encounter issues, ensure `USBMUXD_SOCKET_ADDRESS` is correctly set in your `~/.bashrc` (it should point to the Unix socket by default, but tools can still connect to the TCP port).
@@ -82,6 +82,28 @@ After run command you will see a menu function termux-usbmuxd
       ```
       or simply close the Termux tab/session and open a new one, then retry.
     - `127.0.0.1:27015` (the TCP port that `termux-usbmuxd` bridges to the real Unix socket via `socat`) is the only value understood identically by both the C tools and the Rust tools, so don't switch it back to a `UNIX:` path.
+
+## Reliability tuning (optional)
+
+Every knob is an environment variable with a sensible default:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SCAN_ATTEMPTS` | 6 | Scan rounds before giving up |
+| `SCAN_DELAY` | 2 | Seconds between scan rounds |
+| `USBSCAN_TIMEOUT` | 8 | Per-round timeout for `termux-usb -l` |
+| `START_WAIT` | 20 | Seconds to wait for the daemon sockets |
+| `PERM_ATTEMPTS` | 3 | USB permission request attempts |
+| `VERIFY_ATTEMPTS` | 10 | `idevice_id -l` retries after start |
+| `USBMUXD_TCP_PORT` | 27015 | TCP port exposed by socat |
+
+Example: `SCAN_ATTEMPTS=10 START_WAIT=30 termux-usbmuxd start`
+
+Notes:
+
+- The TCP readiness check reads `/proc/net/tcp` directly, so `netstat` is no longer required.
+- `termux-usbmuxd status` is now a real subcommand (it used to fall through to the interactive menu).
+- The device-path form from Step-To-Step.md works too: `termux-usbmuxd start /dev/bus/usb/001/002` (or just `termux-usbmuxd /dev/bus/usb/001/002`).
 
 ## Contributing
 

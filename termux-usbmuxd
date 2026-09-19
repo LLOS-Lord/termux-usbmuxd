@@ -23,6 +23,13 @@
 #      Android popup no longer kills the whole start.
 #   7. After the daemon is up, idevice_id -l verifies the iPhone is actually
 #      attached before Start reports success.
+#   8. Menu Pair/Info and the pair/info subcommands talk to the Unix socket
+#      directly (the path Start already proved works) instead of inheriting
+#      the TCP env - a dead socat relay can no longer break Pair with a
+#      misleading "No device found".
+#   9. The TCP relay is verified end-to-end with a real usbmuxd ReadBUID
+#      exchange (a listening port alone proves nothing) and auto-revived by
+#      restarting the socat forwarder when it is dead.
 #
 set -euo pipefail
 
@@ -195,6 +202,85 @@ tcp_listening() {
   grep -qiE ":$hp[[:space:]]+[^[:space:]]+[[:space:]]+0A[[:space:]]" /proc/net/tcp6 2>/dev/null
 }
 
+# End-to-end check of the TCP relay: 127.0.0.1:$TCP_PORT -> socat -> unix
+# socket -> usbmuxd. Sends a real usbmuxd plist "ReadBUID" request and
+# requires a plist reply containing "BUID". A listening TCP port alone
+# proves nothing: socat accepts the connection first and fails later when
+# its unix-side connect dies, so a dead relay looks exactly like a live
+# port until something actually speaks the protocol.
+tcp_probe() {
+  local xml esc0 esc1 reply
+  command -v od >/dev/null 2>&1 || return 1
+  xml='<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>BundleID</key><string>termux-usbmuxd</string><key>ClientVersionString</key><string>probe</string><key>MessageType</key><string>ReadBUID</string><key>ProgName</key><string>termux-usbmuxd</string><key>kLibUSBMuxVersion</key><integer>3</integer></dict></plist>'
+  # usbmuxd packet header: 4x u32 little-endian - length (16+payload),
+  # protocol version 1, MESSAGE_PLIST (8), tag 1. The escaped octets are
+  # glued onto the payload inside the child below via printf %b.
+  esc0=$(printf '%03o' $(( (16 + ${#xml}) & 0xFF )))
+  esc1=$(printf '%03o' $(( ((16 + ${#xml}) >> 8) & 0xFF )))
+  reply=$(
+    PROBE_PORT="$TCP_PORT" PROBE_B0="$esc0" PROBE_B1="$esc1" PROBE_XML="$xml" \
+      timeout 5 bash --noprofile --norc -c '
+        exec 3<>"/dev/tcp/127.0.0.1/$PROBE_PORT" 2>/dev/null || exit 1
+        printf "%b" "\\$PROBE_B0\\$PROBE_B1\000\000\001\000\000\000\010\000\000\000\001\000\000\000" >&3 || exit 1
+        printf "%s" "$PROBE_XML" >&3 || exit 1
+        IFS=" " read -r b0hex b1hex _rest < <(dd bs=1 count=16 <&3 2>/dev/null | od -An -tx1 -v | head -n 1)
+        [[ "$b0hex" =~ ^[0-9a-f]{2}$ && "$b1hex" =~ ^[0-9a-f]{2}$ ]] || exit 2
+        rlen=$(( 16#$b0hex + 16#$b1hex * 256 ))
+        if (( rlen > 16 && rlen <= 4096 )); then
+          dd bs=1 count=$(( rlen - 16 )) <&3 2>/dev/null
+        else
+          exit 2
+        fi
+      ' 2>/dev/null
+  ) || return 1
+  [[ "$reply" == *"BUID"* ]]
+}
+
+# The socat forwarder can die independently of usbmuxd (crash, OOM, manual
+# kill) while its TCP port keeps showing LISTEN. tcp_probe has already
+# failed when this runs: revive the relay WITHOUT touching the running
+# daemon (restarting usbmuxd would drop the USB session).
+ensure_tcp_relay() {
+  command -v socat >/dev/null 2>&1 || {
+    log_warn "socat is not installed - the TCP relay needed by Rust idevice-tools cannot work. Fix: pkg install socat"
+    return 1
+  }
+  [[ -S "$SOCKET" ]] || return 1
+  log_info "Restarting the socat TCP forwarder ($TCP_PORT -> $SOCKET)..."
+  pkill -x "socat" >/dev/null 2>&1 || true
+  nohup socat "TCP4-LISTEN:$TCP_PORT,reuseaddr,fork" "UNIX-CONNECT:$SOCKET" >>"$LOGFILE" 2>&1 &
+  sleep 1
+  if tcp_probe; then
+    log_info "TCP relay revived: usbmuxd answers through 127.0.0.1:$TCP_PORT again."
+    return 0
+  fi
+  log_warn "TCP relay could not be revived. Menu options 3/4 and pair/info are NOT affected"
+  log_warn "(they use the Unix socket directly) - only standalone Rust idevice-tools need it."
+  return 1
+}
+
+# Run a libimobiledevice tool against the Unix socket directly. Start has
+# already proven this path works (verify_device prints the UDID through it),
+# while the TCP relay adds a socat dependency that can silently break - the
+# reported case: Start succeeds, then menu Pair says "No device found."
+# because idevicepair inherited the TCP env and the relay was not passing
+# usbmuxd traffic. Also pre-check the daemon: without it these tools fail
+# with the same misleading "No device found" instead of a usable message.
+run_ld_tool() {
+  local tool=$1
+  shift
+  if ! pgrep -x "usbmuxd" >/dev/null 2>&1; then
+    log_error "usbmuxd is not running - '$tool' would just say 'No device found'."
+    log_error "Run option 1 (Start) first, or: termux-usbmuxd start"
+    return 1
+  fi
+  if [[ ! -S "$SOCKET" ]]; then
+    log_error "usbmuxd Unix socket is missing at $SOCKET - run option 1 (Start) to restart cleanly."
+    return 1
+  fi
+  USBMUXD_SOCKET_ADDRESS="UNIX:$SOCKET" "$tool" "$@"
+}
+
 cleanup_old_processes() {
   # IMPORTANT: usbmuxd/usbmuxd_proxy are not the only things holding the USB
   # device open. The background "termux-usb -E -e ..." call from a previous
@@ -346,7 +432,12 @@ start_daemon() {
     log_warn "usbmuxd Unix socket NOT ready."
   fi
   if tcp_listening; then
-    log_info "usbmuxd TCP socket is ready at 127.0.0.1:$TCP_PORT"
+    if tcp_probe; then
+      log_info "usbmuxd TCP relay is ready at 127.0.0.1:$TCP_PORT (verified end-to-end)"
+    else
+      log_warn "TCP port $TCP_PORT is listening but does not pass usbmuxd traffic - reviving the socat relay..."
+      ensure_tcp_relay || true
+    fi
   else
     log_warn "usbmuxd TCP socket NOT ready (check if 'socat' is installed)."
   fi
@@ -454,7 +545,11 @@ show_status() {
   if pgrep -x "usbmuxd" >/dev/null 2>&1; then
     echo -e "Status: ${GREEN}RUNNING${NC}"
     if tcp_listening; then
-      echo "TCP socket: listening on 127.0.0.1:$TCP_PORT"
+      if tcp_probe; then
+        echo "TCP socket: listening on 127.0.0.1:$TCP_PORT (relay verified)"
+      else
+        echo "TCP socket: listening on 127.0.0.1:$TCP_PORT but relay NOT passing usbmuxd traffic"
+      fi
     else
       echo "TCP socket: NOT listening"
     fi
@@ -483,8 +578,8 @@ interactive_menu() {
     case $opt in
       1) start_usbmuxd || log_warn "Start failed - see messages above." ;;
       2) stop_usbmuxd || true ;;
-      3) idevicepair pair || log_warn "Pairing failed - is the device unlocked and usbmuxd running or trusted connect ?" ;;
-      4) ideviceinfo || log_warn "Could not get device info - is usbmuxd running (option 1) and the device connected or trusted connect ?" ;;
+      3) run_ld_tool idevicepair pair || log_warn "Pairing failed - is the device unlocked, trusted connect done, and usbmuxd running (option 1) ?" ;;
+      4) run_ld_tool ideviceinfo || log_warn "Could not get device info - is usbmuxd running (option 1) and the device connected or trusted connect ?" ;;
       5) fix_shell_rc; log_info "Check complete. If you see a [WARN] line above, remember to run 'source ~/.bashrc' or open a new Termux tab before using idevice-tools/idevicepair outside of this menu." ;;
       q) exit 0 ;;
     esac
@@ -501,12 +596,17 @@ case "$1" in
   start) start_usbmuxd ;;
   stop) stop_usbmuxd ;;
   status) show_status ;;
-  pair) idevicepair pair || log_warn "Pairing failed - is the device unlocked and usbmuxd running (termux-usbmuxd start) ?" ;;
-  info) ideviceinfo || log_warn "Could not get device info - is usbmuxd running (termux-usbmuxd start) ?" ;;
+  pair) run_ld_tool idevicepair pair || log_warn "Pairing failed - is the device unlocked and usbmuxd running (termux-usbmuxd start) ?" ;;
+  info) run_ld_tool ideviceinfo || log_warn "Could not get device info - is usbmuxd running (termux-usbmuxd start) ?" ;;
   doctor)
     fix_shell_rc
     if tcp_listening; then
-      log_info "TCP $TCP_PORT: LISTENING"
+      if tcp_probe; then
+        log_info "TCP relay $TCP_PORT: LISTENING and passing usbmuxd traffic"
+      else
+        log_warn "TCP relay $TCP_PORT: listening but NOT passing usbmuxd traffic (Rust idevice-tools will fail)"
+        ensure_tcp_relay || true
+      fi
     else
       log_warn "TCP $TCP_PORT: not listening (usbmuxd not running?)"
     fi

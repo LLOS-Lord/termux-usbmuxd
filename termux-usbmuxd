@@ -50,6 +50,10 @@
 #      Pair/Info refused to run). The probe now keeps the connection open
 #      until the reply arrives (like libusbmuxd does), is retried, cross-checked
 #      with idevice_id, and can no longer veto a tool run when the socket exists.
+#  12. Pair / Info now WAIT for the "Trust This Computer?" tap instead of
+#      failing with "Pairing dialog response pending (-19)": they poll
+#      `idevicepair pair` until the user accepts (TRUST_TIMEOUT, default 60s;
+#      0 = don't wait; Ctrl+C cancels the wait and returns to the menu).
 #
 set -euo pipefail
 
@@ -345,9 +349,118 @@ ensure_tcp_relay() {
   return 1
 }
 
+# --- Waiting for the "Trust This Computer?" prompt ---------------------------
+# A first pairing needs a human: iOS only shows the prompt while the phone is
+# unlocked, and lockdownd keeps answering "Pairing dialog response pending
+# (-19)" until it is tapped. Rather than failing and making the user re-run
+# the menu entry, Pair/Info poll `idevicepair pair` until the tap happens.
+#   TRUST_TIMEOUT   seconds to wait (default 60; 0 = don't wait, just hint)
+#   TRUST_INTERVAL  seconds between attempts (default 3)
+TRUST_TIMEOUT="${TRUST_TIMEOUT:-60}"
+TRUST_INTERVAL="${TRUST_INTERVAL:-3}"
+[[ "$TRUST_TIMEOUT" =~ ^[0-9]+$ ]] || TRUST_TIMEOUT=60
+[[ "$TRUST_INTERVAL" =~ ^[0-9]+(\.[0-9]+)?$ ]] || TRUST_INTERVAL=3
+TRUST_CANCEL=0
+
 # Run a libimobiledevice tool against the Unix socket directly. Start has
 # already proven this path works (verify_device prints the UDID through it),
 # while the TCP relay adds a socat dependency that can silently break.
+ld_exec() {
+  USBMUXD_SOCKET_ADDRESS="UNIX:$SOCKET" "$@"
+}
+
+# Classify a tool's output ($1 = the text) as one of:
+#   denied   the user tapped "Don't Trust"      (lockdownd -18)
+#   pending  the Trust prompt is up / about to be (lockdownd -19)
+#   locked   phone locked with a passcode, so no prompt can show yet (-17)
+#   other    anything else
+# "denied" is tested first because its message also contains "trust dialog".
+trust_state() {
+  local t=$1
+  if grep -qiE 'denied|\(-18\)' <<<"$t"; then
+    echo denied
+  elif grep -qiE 'dialog response pending|\(-19\)|accept the trust dialog' <<<"$t"; then
+    echo pending
+  elif grep -qiE 'passcode|password protected|is locked|\(-17\)' <<<"$t"; then
+    echo locked
+  else
+    echo other
+  fi
+}
+
+# Poll `idevicepair pair` until the user taps "Trust". Returns 0 = paired,
+# 1 = timeout / real error, 2 = user tapped "Don't Trust", 130 = Ctrl+C.
+# Ctrl+C only cancels the wait (the menu keeps running).
+wait_for_trust() {
+  local t0=$SECONDS out rc result=1 fails=0 next_note=15 locked_noted=0 elapsed
+  TRUST_CANCEL=0
+  trap 'TRUST_CANCEL=1' INT
+
+  log_info "Đang chờ bạn bấm 'Tin cậy' (Trust) trên iPhone - hãy MỞ KHOÁ màn hình, hộp thoại chỉ hiện khi máy đang mở khoá."
+  log_info "Chờ tối đa ${TRUST_TIMEOUT}s. Ctrl+C để huỷ."
+
+  while [[ "$TRUST_CANCEL" -eq 0 ]]; do
+    rc=0
+    out=$(ld_exec idevicepair pair 2>&1) || rc=$?
+
+    case "$(trust_state "$out")" in
+      denied)
+        printf '%s\n' "$out"
+        log_error "Bạn đã chọn 'Không tin cậy'. Rút cáp, cắm lại, chọn 2 rồi 1 để Start lại và bấm 'Tin cậy' khi hộp thoại hiện ra."
+        result=2
+        break
+        ;;
+      pending)
+        fails=0
+        ;;
+      locked)
+        fails=0
+        if [[ "$locked_noted" -eq 0 ]]; then
+          log_warn "iPhone đang khoá - hãy mở khoá (nhập passcode) để hộp thoại 'Tin cậy' hiện ra."
+          locked_noted=1
+        fi
+        ;;
+      *)
+        if [[ "$rc" -eq 0 ]]; then
+          printf '%s\n' "$out"
+          log_info "Đã tin cậy: iPhone đã pair thành công."
+          result=0
+          break
+        fi
+        # Not the "waiting for the tap" state: tolerate a couple of hiccups
+        # (usbmuxd busy, device re-enumerating) but don't spin for a full
+        # minute on a permanent error.
+        fails=$((fails + 1))
+        if [[ "$fails" -ge 3 ]]; then
+          printf '%s\n' "$out"
+          log_error "Pair lỗi 3 lần liên tiếp (không phải do chưa bấm Tin cậy) - kiểm tra cáp/usbmuxd (chọn 1 để Start lại)."
+          result=1
+          break
+        fi
+        ;;
+    esac
+
+    elapsed=$((SECONDS - t0))
+    if [[ "$elapsed" -ge "$TRUST_TIMEOUT" ]]; then
+      log_warn "Hết ${TRUST_TIMEOUT}s mà chưa thấy bấm 'Tin cậy'. Mở khoá iPhone; nếu không thấy hộp thoại thì rút cáp, cắm lại rồi Start lại."
+      result=1
+      break
+    fi
+    if [[ "$elapsed" -ge "$next_note" ]]; then
+      log_info "Vẫn đang chờ bạn bấm 'Tin cậy'... (còn $((TRUST_TIMEOUT - elapsed))s)"
+      next_note=$((next_note + 15))
+    fi
+    sleep "$TRUST_INTERVAL" || true
+  done
+
+  trap - INT
+  if [[ "$TRUST_CANCEL" -ne 0 && "$result" -ne 0 ]]; then
+    log_warn "Đã huỷ chờ."
+    result=130
+  fi
+  return "$result"
+}
+
 # The daemon pre-check is only a courtesy message: it is retried, and when the
 # socket file exists but a probe still fails we run the tool ANYWAY instead of
 # refusing - a heuristic must never block a command that would have worked.
@@ -368,14 +481,34 @@ run_ld_tool() {
   local out rc=0
   out=$(mktemp 2>/dev/null) || out=""
   if [[ -z "$out" ]]; then
-    USBMUXD_SOCKET_ADDRESS="UNIX:$SOCKET" "$tool" "$@" || return $?
+    ld_exec "$tool" "$@" || return $?
     return 0
   fi
-  USBMUXD_SOCKET_ADDRESS="UNIX:$SOCKET" "$tool" "$@" 2>&1 | tee "$out" || rc=${PIPESTATUS[0]}
-  if grep -qiE 'dialog response pending|\(-19\)|accept the trust dialog' "$out" 2>/dev/null; then
-    log_warn "The iPhone is waiting for you: unlock it, tap 'Trust' (Tin cậy) on the 'Trust This Computer?' prompt, then run this option again."
-  fi
+  ld_exec "$tool" "$@" 2>&1 | tee "$out" || rc=${PIPESTATUS[0]}
+
+  local state
+  state=$(trust_state "$(cat "$out" 2>/dev/null)")
   rm -f "$out"
+  case "$state" in
+    pending|locked)
+      if [[ "$TRUST_TIMEOUT" -eq 0 ]]; then
+        log_warn "iPhone đang chờ bạn mở khoá và bấm 'Tin cậy' (Trust): làm xong rồi chạy lại mục này."
+        [[ "$rc" -ne 0 ]] || rc=1
+        return "$rc"
+      fi
+      wait_for_trust || return $?
+      # `idevicepair pair` is what wait_for_trust just ran successfully.
+      if [[ "$tool" == "idevicepair" ]]; then
+        return 0
+      fi
+      log_info "Chạy lại: $tool${*:+ $*}"
+      ld_exec "$tool" "$@" || return $?
+      return 0
+      ;;
+    denied)
+      log_error "Bạn đã chọn 'Không tin cậy'. Rút cáp, cắm lại, chọn 2 rồi 1 để Start lại và bấm 'Tin cậy' khi hộp thoại hiện ra."
+      ;;
+  esac
   return "$rc"
 }
 

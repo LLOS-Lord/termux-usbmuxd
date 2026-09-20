@@ -30,6 +30,26 @@
 #   9. The TCP relay is verified end-to-end with a real usbmuxd ReadBUID
 #      exchange (a listening port alone proves nothing) and auto-revived by
 #      restarting the socat forwarder when it is dead.
+#  10. Process management no longer uses pkill/pgrep: (a) on many devices
+#      Android's seccomp profile kills procps pkill with SIGSYS ("Bad system
+#      call") the moment it signals a process, so the old cleanup silently
+#      killed nothing and the stale USB session stayed claimed; (b) the
+#      daemon is exec'd as "usbmuxd_proxy" under termux-usb, so
+#      "pgrep -x usbmuxd" never matched and Pair reported "usbmuxd is not
+#      running" right after a successful Start. Daemon detection now probes
+#      the usbmuxd socket itself (ReadBUID over the Unix socket) and process
+#      killing walks /proc with the classic kill(2) builtin.
+#  11. ROOT CAUSE of "Start works, but Pair/Info say 'usbmuxd is not running'
+#      almost every time": the liveness probe (unix_probe) sent its request
+#      with `printf ... | socat - UNIX-CONNECT:...`, i.e. it half-closed the
+#      connection (EOF) right after the request. usbmuxd answers a request by
+#      QUEUEING the reply and flushing it on a later poll round, and its
+#      client_process() handles POLLIN before POLLOUT: an EOF that arrives
+#      first makes recv() return 0 -> client_close() -> the reply is thrown
+#      away. The daemon was fine; the probe randomly reported it dead (and
+#      Pair/Info refused to run). The probe now keeps the connection open
+#      until the reply arrives (like libusbmuxd does), is retried, cross-checked
+#      with idevice_id, and can no longer veto a tool run when the socket exists.
 #
 set -euo pipefail
 
@@ -208,17 +228,24 @@ tcp_listening() {
 # proves nothing: socat accepts the connection first and fails later when
 # its unix-side connect dies, so a dead relay looks exactly like a live
 # port until something actually speaks the protocol.
+# Shared usbmuxd plist "ReadBUID" request payload for both probes below.
+USBMUXD_PROBE_XML='<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>BundleID</key><string>termux-usbmuxd</string><key>ClientVersionString</key><string>probe</string><key>MessageType</key><string>ReadBUID</string><key>ProgName</key><string>termux-usbmuxd</string><key>kLibUSBMuxVersion</key><integer>3</integer></dict></plist>'
+
+# usbmuxd packet header: 4x u32 little-endian - length (16+payload),
+# protocol version 1, MESSAGE_PLIST (8), tag 1. Sets PROBE_ESC0/PROBE_ESC1
+# to the octal escapes of the little-endian length field; the caller glues
+# them onto the rest of the header via printf %b.
+probe_header_escapes() {
+  PROBE_ESC0=$(printf '%03o' $(( (16 + ${#USBMUXD_PROBE_XML}) & 0xFF )))
+  PROBE_ESC1=$(printf '%03o' $(( ((16 + ${#USBMUXD_PROBE_XML}) >> 8) & 0xFF )))
+}
+
 tcp_probe() {
-  local xml esc0 esc1 reply
+  local reply
   command -v od >/dev/null 2>&1 || return 1
-  xml='<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>BundleID</key><string>termux-usbmuxd</string><key>ClientVersionString</key><string>probe</string><key>MessageType</key><string>ReadBUID</string><key>ProgName</key><string>termux-usbmuxd</string><key>kLibUSBMuxVersion</key><integer>3</integer></dict></plist>'
-  # usbmuxd packet header: 4x u32 little-endian - length (16+payload),
-  # protocol version 1, MESSAGE_PLIST (8), tag 1. The escaped octets are
-  # glued onto the payload inside the child below via printf %b.
-  esc0=$(printf '%03o' $(( (16 + ${#xml}) & 0xFF )))
-  esc1=$(printf '%03o' $(( ((16 + ${#xml}) >> 8) & 0xFF )))
+  probe_header_escapes
   reply=$(
-    PROBE_PORT="$TCP_PORT" PROBE_B0="$esc0" PROBE_B1="$esc1" PROBE_XML="$xml" \
+    PROBE_PORT="$TCP_PORT" PROBE_B0="$PROBE_ESC0" PROBE_B1="$PROBE_ESC1" PROBE_XML="$USBMUXD_PROBE_XML" \
       timeout 5 bash --noprofile --norc -c '
         exec 3<>"/dev/tcp/127.0.0.1/$PROBE_PORT" 2>/dev/null || exit 1
         printf "%b" "\\$PROBE_B0\\$PROBE_B1\000\000\001\000\000\000\010\000\000\000\001\000\000\000" >&3 || exit 1
@@ -236,6 +263,65 @@ tcp_probe() {
   [[ "$reply" == *"BUID"* ]]
 }
 
+# Same ReadBUID exchange, but against the Unix socket directly.
+#
+# IMPORTANT - do NOT half-close the connection before the reply is in.
+# usbmuxd answers by queueing the reply and flushing it on a LATER poll round,
+# and client_process() there does `if (POLLIN) input_buffer_process(); else if
+# (POLLOUT) output_buffer_process();`. A plain `printf ... | socat -` sends EOF
+# (shutdown(SHUT_WR)) immediately after the request, so POLLIN(EOF) is usually
+# already pending when the reply is due: recv()==0 -> client_close() -> reply
+# silently dropped. That made a perfectly healthy daemon look dead.
+# The writer below therefore stays open (`sleep`) so the EOF only reaches
+# usbmuxd AFTER the reply had time to be flushed. `tr -d '\000'` drops the NUL
+# bytes of the binary header so bash's "ignored null byte in input" warning
+# can no longer leak onto the terminal.
+PROBE_HOLD=1 # seconds the request side stays open while waiting for the reply
+unix_probe() {
+  [[ -S "$SOCKET" ]] || return 1
+  command -v socat >/dev/null 2>&1 || return 1
+  local reply
+  probe_header_escapes
+  reply=$(
+    {
+      printf '%b' "\\$PROBE_ESC0\\$PROBE_ESC1\000\000\001\000\000\000\010\000\000\000\001\000\000\000"
+      printf '%s' "$USBMUXD_PROBE_XML"
+      sleep "$PROBE_HOLD"
+    } | timeout 5 socat -t 1 - "UNIX-CONNECT:$SOCKET" 2>/dev/null | tr -d '\000'
+  ) || true
+  [[ "$reply" == *"BUID"* ]]
+}
+
+# Ask usbmuxd through libusbmuxd - exactly what idevicepair/ideviceinfo do.
+# libusbmuxd never half-closes before reading the reply, so this is race-free
+# and fast. Exit status 0 means usbmuxd really answered the device-list query.
+idevice_probe() {
+  command -v idevice_id >/dev/null 2>&1 || return 1
+  USBMUXD_SOCKET_ADDRESS="UNIX:$SOCKET" timeout 5 idevice_id -l >/dev/null 2>&1
+}
+
+# "A usable usbmuxd serves $SOCKET". The daemon's process name is not reliable
+# (it is started through usbmuxd_proxy under termux-usb), so ask the socket
+# itself. Two independent probes, alive if EITHER answers, so one flaky check
+# can never declare a healthy daemon dead.
+daemon_alive() {
+  [[ -S "$SOCKET" ]] || return 1
+  idevice_probe && return 0
+  unix_probe
+}
+
+# daemon_alive with a few short retries (transient hiccups while usbmuxd is
+# busy talking to the iPhone, e.g. during the "Trust This Computer" exchange).
+daemon_alive_retry() {
+  local tries=${1:-3} i
+  [[ -S "$SOCKET" ]] || return 1 # no socket file = no daemon, nothing to wait for
+  for (( i = 1; i <= tries; i++ )); do
+    daemon_alive && return 0
+    if (( i < tries )); then sleep 0.5; fi
+  done
+  return 1
+}
+
 # The socat forwarder can die independently of usbmuxd (crash, OOM, manual
 # kill) while its TCP port keeps showing LISTEN. tcp_probe has already
 # failed when this runs: revive the relay WITHOUT touching the running
@@ -247,7 +333,7 @@ ensure_tcp_relay() {
   }
   [[ -S "$SOCKET" ]] || return 1
   log_info "Restarting the socat TCP forwarder ($TCP_PORT -> $SOCKET)..."
-  pkill -x "socat" >/dev/null 2>&1 || true
+  kill_relay
   nohup socat "TCP4-LISTEN:$TCP_PORT,reuseaddr,fork" "UNIX-CONNECT:$SOCKET" >>"$LOGFILE" 2>&1 &
   sleep 1
   if tcp_probe; then
@@ -261,24 +347,77 @@ ensure_tcp_relay() {
 
 # Run a libimobiledevice tool against the Unix socket directly. Start has
 # already proven this path works (verify_device prints the UDID through it),
-# while the TCP relay adds a socat dependency that can silently break - the
-# reported case: Start succeeds, then menu Pair says "No device found."
-# because idevicepair inherited the TCP env and the relay was not passing
-# usbmuxd traffic. Also pre-check the daemon: without it these tools fail
-# with the same misleading "No device found" instead of a usable message.
+# while the TCP relay adds a socat dependency that can silently break.
+# The daemon pre-check is only a courtesy message: it is retried, and when the
+# socket file exists but a probe still fails we run the tool ANYWAY instead of
+# refusing - a heuristic must never block a command that would have worked.
 run_ld_tool() {
   local tool=$1
   shift
-  if ! pgrep -x "usbmuxd" >/dev/null 2>&1; then
-    log_error "usbmuxd is not running - '$tool' would just say 'No device found'."
+  if [[ ! -S "$SOCKET" ]]; then
+    log_error "usbmuxd is not running (no socket at $SOCKET) - '$tool' would just say 'No device found'."
     log_error "Run option 1 (Start) first, or: termux-usbmuxd start"
     return 1
   fi
-  if [[ ! -S "$SOCKET" ]]; then
-    log_error "usbmuxd Unix socket is missing at $SOCKET - run option 1 (Start) to restart cleanly."
-    return 1
+  if ! daemon_alive_retry 3; then
+    log_warn "usbmuxd did not answer the liveness probe, but its socket exists - running '$tool' anyway."
   fi
-  USBMUXD_SOCKET_ADDRESS="UNIX:$SOCKET" "$tool" "$@"
+
+  # Stream the tool's output live, but keep a copy to recognise the one case
+  # that is not a fault: the iPhone waiting for the user to tap "Trust".
+  local out rc=0
+  out=$(mktemp 2>/dev/null) || out=""
+  if [[ -z "$out" ]]; then
+    USBMUXD_SOCKET_ADDRESS="UNIX:$SOCKET" "$tool" "$@" || return $?
+    return 0
+  fi
+  USBMUXD_SOCKET_ADDRESS="UNIX:$SOCKET" "$tool" "$@" 2>&1 | tee "$out" || rc=${PIPESTATUS[0]}
+  if grep -qiE 'dialog response pending|\(-19\)|accept the trust dialog' "$out" 2>/dev/null; then
+    log_warn "The iPhone is waiting for you: unlock it, tap 'Trust' (Tin cậy) on the 'Trust This Computer?' prompt, then run this option again."
+  fi
+  rm -f "$out"
+  return "$rc"
+}
+
+# --- Process discovery & signalling without pkill/pgrep --------------------
+# On many Android devices the seccomp profile kills procps' pkill with SIGSYS
+# ("Bad system call") the moment it actually signals a process, so the old
+# cleanup killed nothing and the stale daemon kept holding the USB file
+# descriptor (Start then said "up" while usbmuxd could not attach the
+# device). Walk /proc directly and use the kill BUILTIN (classic kill(2)),
+# which is not affected by the seccomp filter that breaks procps tools.
+kill_by_name() {
+  # $1 = exact process name as shown in /proc/<pid>/comm, $2 = signal (TERM).
+  local pid sig=${2:-TERM}
+  for pid in /proc/[0-9]*; do
+    [[ "$(cat "$pid/comm" 2>/dev/null)" == "$1" ]] || continue
+    kill -"$sig" "${pid#/proc/}" 2>/dev/null || true
+  done
+  return 0
+}
+kill_by_cmdline() {
+  # $1 = ERE matched against the full cmdline (NUL-separated args joined
+  # with spaces). Skips this script itself ("$$").
+  local pid cmd re=$1
+  for pid in /proc/[0-9]*; do
+    [[ "${pid#/proc/}" == "$$" ]] && continue
+    cmd=$(tr '\0' ' ' <"$pid/cmdline" 2>/dev/null) || continue
+    [[ -n "$cmd" && "$cmd" =~ $re ]] || continue
+    kill -TERM "${pid#/proc/}" 2>/dev/null || true
+  done
+  return 0
+}
+kill_relay() {
+  # Only OUR forwarder (socat ... TCP4-LISTEN:<port>): never an unrelated socat
+  # that the user may be running for something else.
+  kill_by_cmdline "socat .*TCP4-LISTEN:${TCP_PORT}([^0-9]|\$)"
+}
+proc_running_by_name() {
+  local pid
+  for pid in /proc/[0-9]*; do
+    [[ "$(cat "$pid/comm" 2>/dev/null)" == "$1" ]] && return 0
+  done
+  return 1
 }
 
 cleanup_old_processes() {
@@ -287,11 +426,11 @@ cleanup_old_processes() {
   # start_usbmuxd() run keeps the USB file descriptor claimed until that
   # exact process is killed - if it's left running, the NEXT scan
   # (termux-usb -l) will hang indefinitely waiting on Termux:API.
-  pkill -x "usbmuxd" || true
-  pkill -x "usbmuxd_proxy" || true
-  pkill -f "termux-usb .*-e " || true
-  pkill -x "termux-usb" || true
-  pkill -x "socat" || true
+  kill_by_name "usbmuxd"
+  kill_by_name "usbmuxd_proxy"
+  kill_by_cmdline 'termux-usb .*-e '
+  kill_by_name "termux-usb"
+  kill_relay
   # If a previous run was killed abruptly (OOM, force-close, crash) the Unix
   # socket file can be left behind and make bind() fail with "Address already
   # in use". Remove it (and any stale pidfile) before starting again.
@@ -300,12 +439,19 @@ cleanup_old_processes() {
   # so the USB FD is actually released before the device is opened again.
   local i=0
   while (( i < 10 )); do
-    if ! pgrep -x "usbmuxd" >/dev/null 2>&1 && ! pgrep -x "usbmuxd_proxy" >/dev/null 2>&1; then
+    if ! proc_running_by_name "usbmuxd" && ! proc_running_by_name "usbmuxd_proxy"; then
       break
     fi
     sleep 0.5
     i=$((i + 1))
   done
+  # Escalate to SIGKILL for anything that ignored TERM (usbmuxd handles it,
+  # but a hung proxy/wrapper may not) so the FD can never leak across starts.
+  if proc_running_by_name "usbmuxd" || proc_running_by_name "usbmuxd_proxy"; then
+    kill_by_name "usbmuxd" KILL
+    kill_by_name "usbmuxd_proxy" KILL
+    sleep 1
+  fi
   # Give Termux:API a moment to notice the closed connection and hand the
   # device back to Android before we request it again.
   sleep 1
@@ -399,8 +545,7 @@ request_permission() {
 
 # True when a running usbmuxd actually serves a visible iPhone.
 daemon_healthy() {
-  pgrep -x "usbmuxd" >/dev/null 2>&1 || return 1
-  [[ -S "$SOCKET" ]] || return 1
+  daemon_alive || return 1
   command -v idevice_id >/dev/null 2>&1 || return 1
   USBMUXD_SOCKET_ADDRESS="UNIX:$SOCKET" timeout 5 idevice_id -l 2>/dev/null | grep -q .
 }
@@ -418,7 +563,7 @@ start_daemon() {
     if [[ -S "$SOCKET" ]] && tcp_listening; then
       break
     fi
-    if (( waited >= 6 )) && ! pgrep -x "usbmuxd" >/dev/null 2>&1 && ! pgrep -x "usbmuxd_proxy" >/dev/null 2>&1; then
+    if (( waited >= 6 )) && ! proc_running_by_name "usbmuxd" && ! proc_running_by_name "usbmuxd_proxy"; then
       log_warn "usbmuxd/proxy processes are gone before their sockets appeared."
       break
     fi
@@ -488,10 +633,10 @@ start_usbmuxd() {
   # already-running usbmuxd made Start refuse to rescan, so a stale daemon
   # serving a dead USB session (after a replug) blocked every reconnect.
   # Now it is health-checked and restarted automatically.
-  if pgrep -x "usbmuxd" >/dev/null 2>&1; then
+  if daemon_alive; then
     if daemon_healthy; then
       log_info "usbmuxd is already running and the iPhone is visible through it."
-      log_info "Nothing to do. If tools still fail, run option 5 (doctor) and open a NEW shell."
+      log_info "Nothing to do. If tools still fail, run: termux-usbmuxd doctor (and open a NEW shell)."
       return 0
     fi
     log_warn "usbmuxd is running but no iPhone is visible through it - restarting it cleanly."
@@ -542,7 +687,7 @@ stop_usbmuxd() {
 }
 
 show_status() {
-  if pgrep -x "usbmuxd" >/dev/null 2>&1; then
+  if daemon_alive; then
     echo -e "Status: ${GREEN}RUNNING${NC}"
     if tcp_listening; then
       if tcp_probe; then
@@ -586,6 +731,9 @@ interactive_menu() {
   done
 }
 
+# When this file is `source`d (tests / debugging) only define the functions.
+if (return 0 2>/dev/null); then return 0; fi # true only when sourced
+
 # Self-heal known-bad USBMUXD_SOCKET_ADDRESS values in shell rc files on every
 # invocation (not just at install time), so drift from other guides/older
 # installs gets corrected automatically. Safe/no-op if nothing is wrong.
@@ -612,6 +760,11 @@ case "$1" in
     fi
     if [[ -S "$SOCKET" ]]; then
       log_info "Unix socket: present at $SOCKET"
+      if daemon_alive_retry 3; then
+        log_info "usbmuxd: ANSWERING on the Unix socket"
+      else
+        log_warn "usbmuxd: socket exists but nothing answers (stale socket? run option 2 then option 1)"
+      fi
     else
       log_warn "Unix socket: missing (usbmuxd not running?)"
     fi

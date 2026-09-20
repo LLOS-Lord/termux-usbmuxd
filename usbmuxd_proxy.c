@@ -12,12 +12,34 @@
  * Được thiết kế để bỏ qua các tín hiệu terminal và giữ usbmuxd sống bền bỉ.
  */
 
+#ifndef USBMUXD_PATH
+#define USBMUXD_PATH "/data/data/com.termux/files/usr/bin/usbmuxd"
+#endif
+
+// PID các tiến trình con, để chuyển tiếp SIGTERM/SIGINT khi script Stop.
+// Trước đây proxy bị kill nhưng usbmuxd/socat con vẫn sống "mồ côi" và giữ
+// nguyên USB FD -> lần Start kế tiếp không claim lại được thiết bị.
+static volatile sig_atomic_t g_usbmuxd_pid = 0;
+static volatile sig_atomic_t g_socat_pid = 0;
+
+static void forward_signal(int sig) {
+    if (g_usbmuxd_pid > 0) kill((pid_t)g_usbmuxd_pid, sig);
+    if (g_socat_pid > 0) kill((pid_t)g_socat_pid, sig);
+}
+
 int main(int argc, char *argv[]) {
     // Bỏ qua các tín hiệu terminal để tránh bị kill khi shell đóng hoặc chuyển background
     signal(SIGHUP, SIG_IGN);
     signal(SIGPIPE, SIG_IGN);
     signal(SIGTTIN, SIG_IGN);
     signal(SIGTTOU, SIG_IGN);
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = forward_signal;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT, &sa, NULL);
 
     char *fd_str = getenv("FD");
     if (!fd_str) fd_str = getenv("TERMUX_USB_FD");
@@ -35,7 +57,7 @@ int main(int argc, char *argv[]) {
     snprintf(libusb_fd_env, sizeof(libusb_fd_env), "LIBUSB_FD=%d", fd);
     putenv(libusb_fd_env);
 
-    const char *usbmuxd_path = "/data/data/com.termux/files/usr/bin/usbmuxd";
+    const char *usbmuxd_path = USBMUXD_PATH;
 
     // Phân tích các đối số từ script
     int has_f = 0;
@@ -71,15 +93,15 @@ int main(int argc, char *argv[]) {
     // và chúng ta sẽ dùng `socat` để forward từ TCP sang Unix socket đó.
     // Điều này đảm bảo cả hai đều hoạt động mà không cần can thiệp sâu vào usbmuxd.
 
-    int usbmuxd_argc = 1; // usbmuxd_path
-    if (!has_f) usbmuxd_argc++;
+    (void)has_f; // luôn chạy foreground: proxy phải là cha của usbmuxd
+    int usbmuxd_argc = 2; // usbmuxd_path + -f
     if (unix_socket_path) usbmuxd_argc += 2; // -S <path>
     if (pidfile_path) usbmuxd_argc += 2; // -P <path>
     
     char **usbmuxd_argv = malloc(sizeof(char *) * (usbmuxd_argc + 1));
     int j = 0;
     usbmuxd_argv[j++] = (char *)usbmuxd_path;
-    if (!has_f) usbmuxd_argv[j++] = "-f";
+    usbmuxd_argv[j++] = "-f";
     if (unix_socket_path) {
         usbmuxd_argv[j++] = "-S";
         usbmuxd_argv[j++] = unix_socket_path;
@@ -105,15 +127,26 @@ int main(int argc, char *argv[]) {
     pid_t pid = fork();
 
     if (pid == 0) {
+        signal(SIGTERM, SIG_DFL);
+        signal(SIGINT, SIG_DFL);
         execv(usbmuxd_path, usbmuxd_argv);
         perror("usbmuxd_proxy: usbmuxd execv failed");
         exit(1);
     } else if (pid > 0) {
+        g_usbmuxd_pid = pid;
+        pid_t socat_pid = -1;
         // Khởi động socat để forward TCP sang Unix socket nếu có tcp_port
         if (tcp_port && unix_socket_path) {
             fprintf(stderr, "usbmuxd_proxy: Starting TCP forwarder on port %s -> %s\n", tcp_port, unix_socket_path);
-            pid_t socat_pid = fork();
+            socat_pid = fork();
             if (socat_pid == 0) {
+                // Con không được chạy handler chuyển tiếp của cha.
+                signal(SIGTERM, SIG_DFL);
+                signal(SIGINT, SIG_DFL);
+                // socat KHÔNG cần USB FD. Nếu để nó thừa hưởng FD này thì khi usbmuxd
+                // chết, socat mồ côi vẫn giữ FD -> USB interface vẫn bị "claim" và
+                // lần Start sau bị BUSY. Đóng ngay trước khi exec.
+                close(fd);
                 // Chờ usbmuxd thực sự tạo xong Unix socket thay vì sleep() cố định:
                 // trên máy chậm 2 giây có thể chưa đủ (socat sẽ exec lỗi và không
                 // tự thử lại), còn trên máy nhanh thì lãng phí thời gian khởi động.
@@ -136,13 +169,29 @@ int main(int argc, char *argv[]) {
                 // Nếu không có socat, thử dùng bản build-in hoặc báo lỗi
                 perror("usbmuxd_proxy: socat exec failed (TCP forwarding will not work)");
                 exit(1);
+            } else if (socat_pid > 0) {
+                g_socat_pid = socat_pid;
             }
         }
 
-        int status;
-        waitpid(pid, &status, 0);
+        int status = 0;
+        pid_t w;
+        // waitpid có thể bị ngắt bởi SIGTERM/SIGINT (đã chuyển tiếp cho con): thử lại.
+        do {
+            w = waitpid(pid, &status, 0);
+        } while (w < 0 && errno == EINTR);
+        g_usbmuxd_pid = 0;
         fprintf(stderr, "usbmuxd_proxy: usbmuxd exited with %d.\n", status);
-        // Kill socat if it's still running (tùy chọn, socat thường tự thoát nếu socket mất)
+
+        // usbmuxd đã thoát -> dọn socat, không để relay TCP mồ côi (cổng vẫn LISTEN
+        // nhưng không còn daemon phía sau).
+        if (socat_pid > 0) {
+            g_socat_pid = 0;
+            kill(socat_pid, SIGTERM);
+            do {
+                w = waitpid(socat_pid, NULL, 0);
+            } while (w < 0 && errno == EINTR);
+        }
     } else {
         perror("usbmuxd_proxy: fork failed");
         return 1;
